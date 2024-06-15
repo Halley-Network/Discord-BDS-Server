@@ -1,0 +1,12 @@
+{
+    "discordToken": "YOUR_DISCORD_BOT_TOKEN",
+    "guildId": "YOUR_GUILD_ID",
+    "usingChannelId": "YOUR_CHANNEL_ID",
+    "commands": {
+        "enableNormalCommands": true,
+        "opCommands": {
+            "enable": true,
+            "roleId": "YOUR_ROLE_ID" 
+        }
+    }
+}
