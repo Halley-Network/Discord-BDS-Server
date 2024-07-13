@@ -3,7 +3,7 @@ import { default as express } from 'express';
 import { MessageQueue } from './types';
 import * as config from './config.json';
 import * as packageJson from './package.json';
-import { EventEmitter } from 'events';
+import EventEmitter from 'events';
 const client = new Client({ intents: [IntentsBitField.Flags.Guilds, IntentsBitField.Flags.GuildMessages, IntentsBitField.Flags.MessageContent] });
 const app = express();
 const messageQueue: MessageQueue[] = [];
@@ -91,12 +91,12 @@ client.on('interactionCreate', async (interaction) => {
             date: Date.now(),
         });
         interaction.deferReply({ ephemeral: true});
-        const result = await waitId<{ status: boolean, result: string }>(interaction.id);
+        const result = await waitId<{ status: boolean }>(interaction.id);
         interaction.followUp({
             ephemeral: true,
             embeds: [{
                 color: result.status ? 0x00ff00 : 0xff0000,
-                description: result.result,
+                description: result.status ? "正常に実行しました。" : "実行に失敗しました。",
                 title: result.status ? "Success" : "Error",
             }]
         })
@@ -144,8 +144,8 @@ app.get('/messages', (req, res) => {
     res.json(resArray);
 });
 app.post('/eval', (req, res) => {
-    const { id, status, result } = req.body as { id: string, status: boolean, result: string };
-    idEvent.emit(id, { status, result });
+    const { id, status } = req.body as { id: string, status: boolean };
+    idEvent.emit(id, { status });
     res.sendStatus(200);
 });
 app.post('/list', (req, res) => {
