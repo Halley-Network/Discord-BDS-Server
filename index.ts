@@ -1,5 +1,6 @@
 import { ApplicationCommandOptionType, Client, GuildMemberRoleManager, IntentsBitField, TextChannel } from 'discord.js';
 import { default as express } from 'express';
+import { default as bodyParser } from "body-parser";
 import { MessageQueue } from './types';
 import * as config from './config.json';
 import * as packageJson from './package.json';
@@ -60,7 +61,7 @@ client.on('interactionCreate', async (interaction) => {
             id: interaction.id,
             date: Date.now(),
         });
-        interaction.deferReply({ ephemeral: true});
+        interaction.deferReply({ ephemeral: true });
         const result = await waitId<{ players: string[], max: number }>(interaction.id);
         interaction.followUp({
             ephemeral: true,
@@ -90,7 +91,7 @@ client.on('interactionCreate', async (interaction) => {
             content: interaction.options.get("command", true).value as string,
             date: Date.now(),
         });
-        interaction.deferReply({ ephemeral: true});
+        interaction.deferReply({ ephemeral: true });
         const result = await waitId<{ status: boolean }>(interaction.id);
         interaction.followUp({
             ephemeral: true,
@@ -118,7 +119,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 function waitId<T>(id: string): Promise<T> {
-    return new Promise((resolve,reject) => {
+    return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
             reject("Timeout");
         }, 1000 * 60);
@@ -128,7 +129,9 @@ function waitId<T>(id: string): Promise<T> {
         });
     });
 }
-
+app.use(bodyParser.urlencoded({
+    extended: true
+}));
 app.get('/messages', (req, res) => {
     const since = Number(req.query.since);
     if (isNaN(since)) {
