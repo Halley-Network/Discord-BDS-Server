@@ -61,9 +61,8 @@ client.on('interactionCreate', async (interaction) => {
             id: interaction.id,
             date: Date.now(),
         });
-        interaction.deferReply({ ephemeral: true });
         const result = await waitId<{ players: string[], max: number }>(interaction.id);
-        interaction.followUp({
+        interaction.reply({
             ephemeral: true,
             embeds: [{
                 description: result.players.length == 0 ? "プレイヤーはいません。" : "- " + result.players.join("- \n"),
@@ -91,9 +90,8 @@ client.on('interactionCreate', async (interaction) => {
             content: interaction.options.get("command", true).value as string,
             date: Date.now(),
         });
-        interaction.deferReply({ ephemeral: true });
         const result = await waitId<{ status: boolean }>(interaction.id);
-        interaction.followUp({
+        interaction.reply({
             ephemeral: true,
             embeds: [{
                 color: result.status ? 0x00ff00 : 0xff0000,
@@ -132,6 +130,7 @@ function waitId<T>(id: string): Promise<T> {
 app.use(bodyParser.urlencoded({
     extended: true
 }));
+app.use(bodyParser.json());
 app.get('/messages', (req, res) => {
     const since = Number(req.query.since);
     if (isNaN(since)) {
