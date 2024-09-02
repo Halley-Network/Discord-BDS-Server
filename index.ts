@@ -165,7 +165,26 @@ app.post('/send', (req, res) => {
         }]
     })
 });
-
+app.post('/join', (req, res) => {
+    const { player } = req.body as { player: string };
+    (client.channels.cache.get(config.usingChannelId) as TextChannel).send({
+        embeds: [{
+            title: "Join",
+            description: `**${player}がサーバーにログインしました。**`,
+            color: 0x00ff00
+        }]
+    })
+});
+app.post('/leave', (req, res) => {
+    const { player } = req.body as { player: string };
+    (client.channels.cache.get(config.usingChannelId) as TextChannel).send({
+        embeds: [{
+            title: "Leave",
+            description: `**${player}がサーバーからログアウトしました。**`,
+            color: 0xff0000
+        }]
+    })
+});
 process.on('uncaughtException', (err) => {
     console.error('Uncaught Exception:', err);
 });
