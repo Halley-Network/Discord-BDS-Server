@@ -166,5 +166,11 @@ app.post('/send', (req, res) => {
     })
 });
 
-client.login(config.discordToken).catch(console.error);
-app.listen(9000);
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection:', reason);
+});
+client.login(config.discordToken).catch(console.error)
