@@ -192,4 +192,5 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection:', reason);
 });
-client.login(config.discordToken).catch(console.error)
+client.login(config.discordToken).catch(console.error);
+app.listen(9000);
