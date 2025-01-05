@@ -1,12 +1,12 @@
 {
-    "discordToken": "YOUR_DISCORD_BOT_TOKEN",
-    "guildId": "YOUR_GUILD_ID",
-    "usingChannelId": "YOUR_CHANNEL_ID",
+    "discordToken": "ODQwNTA1MjYwNjIzOTIxMTYy.GZ-fVY.HWPxnrKx0WXV8CVPl3B3qC95AsZXgqwMbhDvTs",
+    "guildId": "878955580709031956",
+    "usingChannelId": "1069189621096910908",
     "commands": {
         "enableNormalCommands": true,
         "opCommands": {
             "enable": true,
-            "roleId": "YOUR_ROLE_ID" 
+            "roleId": "878969359492599839"
         }
     }
 }

@@ -185,12 +185,15 @@ app.post('/leave', (req, res) => {
         }]
     })
 });
-process.on('uncaughtException', (err) => {
+process.on('uncaughtException', (err, origin) => {
     console.error('Uncaught Exception:', err);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection:', reason);
 });
+
 client.login(config.discordToken).catch(console.error);
-app.listen(9000);
+app.listen(9000, () => {
+    console.log(`Server listening on port 9000`);
+})
