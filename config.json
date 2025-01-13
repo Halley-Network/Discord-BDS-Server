@@ -1,5 +1,9 @@
 {
+<<<<<<< HEAD
     "discordToken": "-",
+=======
+    "discordToken": "",
+>>>>>>> f773c7a33961e62c837c5170f022c20d14a87be7
     "guildId": "878955580709031956",
     "usingChannelId": "1069189621096910908",
     "commands": {
