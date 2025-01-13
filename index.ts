@@ -137,12 +137,24 @@ app.get('/messages', (req, res) => {
         res.status(400).send("Invalid query parameter.");
         return;
     }
+        //console.log(`Message Queue: ${require('util').inspect(messageQueue)}`);
     const resArray: MessageQueue[] = [];
+        //console.log(`resArray_1: ${require('util').inspect(resArray)}`);
     const queueLength = messageQueue.length;
+        //console.log(`mQ len: ${require('util').inspect(messageQueue.length)}`);
+        //console.log(`mQ shift: ${require('util').inspect(messageQueue.shift())}`);
+        //console.log(`queueLength: ${queueLength}`);
     for (let i = 0; i < queueLength; i++) {
-        const data = messageQueue.shift()!;
-        if (data.date >= since) resArray.push(data);
+        const data = messageQueue.shift();
+            //console.log(`data: ${require('util').inspect(data)}`);
+        if (data === undefined) continue;
+            //console.log(`data2: ${require('util').inspect(data)}`);
+            //console.log(`since: ${require('util').inspect(since)}`);
+            //console.log(`data.date: ${require('util').inspect(data.date)}`);
+        resArray.push(data);
+            //console.log(`resArray_2: ${require('util').inspect(resArray)}`);
     }
+    //console.log(`resArray_3: ${require('util').inspect(resArray)}`);
     res.json(resArray);
 });
 app.post('/eval', (req, res) => {
