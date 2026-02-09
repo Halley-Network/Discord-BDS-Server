@@ -1,15 +1,23 @@
 export type MessageQueue = {
-    type: "message";
-    content: string;
-    author: string;
+    type: "message" | "list" | "eval";
+    author?: string;
+    content?: string;
     date: number;
-} | {
-    type: "eval";
-    id: string;
-    content: string;
-    date: number;
-} | {
-    type: "list";
-    id: string;
-    date: number;
+    id?: string;
+    port?: string;
+}
+
+
+export interface Config {
+    discordToken: string;
+    guildId: string;
+    usingChannelId: string;
+    channelIds: Record<string, string>; // ← ここを追加
+    commands: {
+        enableNormalCommands: boolean;
+        opCommands: {
+        enable: boolean;
+        roleId: string;
+        };
+    };
 }
