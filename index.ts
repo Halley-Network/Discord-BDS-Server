@@ -1,4 +1,4 @@
-import { ApplicationCommandOptionType, Client, GuildMemberRoleManager, IntentsBitField, TextChannel } from 'discord.js';
+import { ApplicationCommandOptionType, Client, GuildMemberRoleManager, IntentsBitField, TextChannel, Events } from 'discord.js';
 import { default as express } from 'express';
 import { default as bodyParser } from "body-parser";
 import { spawn, ChildProcessWithoutNullStreams, exec } from 'child_process';
@@ -7,21 +7,82 @@ import * as path from 'path';
 import EventEmitter from 'events';
 import cors from 'cors';
 import * as config from './config.json';
-import { promisify } from 'util'
+import { promisify } from 'util';
+import mongoose from 'mongoose';
 
 const execAsync = promisify(exec);
 const STATE_FILE = './active_servers.json';
-const client = new Client({ 
+const client = new Client({
     intents: [
-        IntentsBitField.Flags.Guilds, 
-        IntentsBitField.Flags.GuildMessages, 
+        IntentsBitField.Flags.Guilds,
+        IntentsBitField.Flags.GuildMessages,
         IntentsBitField.Flags.MessageContent
-    ] 
+    ]
 });
-
 const app = express();
 app.use(bodyParser.json());
 app.use(cors());
+
+// --- 外部公開用スキーマ ---
+const publicStatusSchema = new mongoose.Schema({
+    port: { type: String, required: true, unique: true },
+    status: { type: String, enum: ['online', 'offline'], required: true },
+    playerCount: { type: Number, default: 0 }, // 現在の人数のみ保持
+    lastUpdate: { type: String, required: true }
+});
+const PublicStatus = mongoose.model('PublicStatus', publicStatusSchema, 'RealTimeStatus');
+
+// 現在の人数だけを保持するメモリ変数
+const serverStats: { [port: string]: number } = {};
+
+// Mongoose 接続とループ開始
+async function connectPublicDB() {
+        try {
+        // serverSelectionTimeoutMS を入れておくと、失敗時にすぐわかります
+        
+        await mongoose.connect(config.mongoUri, {
+            family: 4,
+            serverSelectionTimeoutMS: 10000,
+            tlsAllowInvalidCertificates: true,
+        });
+        //await mongoose.connect(config.mongoUri, mongoose_client);
+        console.log("🍃 Public Database connected to 'ServerStatus' via Mongoose");
+        
+        // 初回起動時にも一度同期を実行
+        updatePublicStatus();
+        setInterval(updatePublicStatus, 10000);
+    } catch (err) {
+        console.error("❌ MongoDB connection error:", err);
+    }
+}
+
+async function updatePublicStatus() {
+    const now = new Date();
+    const timestamp = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+
+    for (const port in detectedServers) {
+        const isActive = activeProcesses[port] !== undefined;
+        
+        // サーバーが停止している場合のみ、人数を 0 にリセットして更新
+        if (!isActive) {
+            try {
+                await PublicStatus.findOneAndUpdate(
+                    { port: port },
+                    {
+                        status: 'offline',
+                        playerCount: 0,
+                        lastUpdate: timestamp
+                    },
+                    { upsert: true }
+                );
+                serverStats[port] = 0; // メモリもリセット
+            } catch (err) {
+                console.error(`❌ DB Sync Error (Offline) [Port ${port}]:`, err);
+            }
+        }
+        // 起動中の場合は API (/:port/list) 側が更新を行うため、ここでは何もしない（上書き防止）
+    }
+}
 
 const activeProcesses: { [port: string]: ChildProcessWithoutNullStreams } = {};
 const detectedServers: { [port: string]: { path: string, cwd: string, channelId: string } } = {};
@@ -29,7 +90,6 @@ const messageQueues: { [port: string]: any[] } = {};
 const idEvent = new EventEmitter();
 
 // --- 状態保存ロジック ---
-
 function saveState() {
     const state: { [port: string]: number } = {};
     for (const port in activeProcesses) {
@@ -155,48 +215,180 @@ async function sendSplitMessage(interaction: any, title: string, text: string) {
     }
 }
 
+// バックアップを実行し、前回との差分も計算する
+async function runBackup(port: string, serverCwd: string) {
+    const managerDir = path.resolve(__dirname);
+    const backupBaseDir = path.join(managerDir, "..", "_backups");
+    const portBackupDir = path.join(backupBaseDir, port);
+    const tempStageDir = path.join(backupBaseDir, "temp_stage", port);
+
+    if (!fs.existsSync(portBackupDir)) fs.mkdirSync(portBackupDir, { recursive: true });
+
+    // --- 差分計算のための準備 ---
+    // 既存のバックアップファイルを取得して日付順にソート
+    const existingFiles = fs.readdirSync(portBackupDir)
+        .filter(f => f.endsWith('.zip'))
+        .map(f => ({ name: f, time: fs.statSync(path.join(portBackupDir, f)).mtime.getTime() }))
+        .sort((a, b) => b.time - a.time);
+
+    const prevBackup = existingFiles[0]; // 最新のファイルが「前回のバックアップ」
+    let prevSize = 0;
+    if (prevBackup) {
+        prevSize = fs.statSync(path.join(portBackupDir, prevBackup.name)).size;
+    }
+
+    // --- 圧縮処理 (前回の Robocopy 方式) ---
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const fileName = `world_backup_${timestamp}.zip`;
+    const destPath = path.join(portBackupDir, fileName);
+    const worldPath = path.join(serverCwd, "worlds");
+
+    try {
+        if (fs.existsSync(tempStageDir)) fs.rmSync(tempStageDir, { recursive: true, force: true });
+        
+        // Robocopy で一時コピー
+        const copyCommand = `robocopy "${worldPath}" "${tempStageDir}" /S /E /COPY:DAT /R:0 /W:0 /NP /NFL /NDL`;
+        try { await execAsync(copyCommand); } catch (e: any) { if (e.code > 7) throw e; }
+
+        // 圧縮
+        const zipCommand = `powershell -Command "Compress-Archive -Path '${tempStageDir}\\*' -DestinationPath '${destPath}' -Force"`;
+        await execAsync(zipCommand);
+    } finally {
+        if (fs.existsSync(tempStageDir)) fs.rmSync(tempStageDir, { recursive: true, force: true });
+    }
+
+    // --- 結果の集計 ---
+    const newSize = fs.statSync(destPath).size;
+    const delta = newSize - prevSize;
+    const formatSize = (bytes: number) => (bytes / (1024 * 1024)).toFixed(2) + " MB";
+
+    return {
+        fileName,
+        size: formatSize(newSize),
+        delta: (delta >= 0 ? "+" : "") + formatSize(delta),
+        isFirst: prevSize === 0
+    };
+}
+
+// --- スレッドIDを保持する変数を追加 ---
+const activeThreads: { [port: string]: string } = {};
+
 // --- サーバー起動処理の共通化 ---
-function startServer(port: string) {
+async function startServer(port: string) {
     const server = detectedServers[port];
     if (!server || activeProcesses[port]) return;
 
+    const logChannel = client.channels.cache.get(config.logChannelId) as TextChannel;
+    if (!logChannel) return console.error("❌ ログチャンネルが見つかりません。");
+
+    // 1. 命名規則に基づいたスレッドの作成 (ポート番号_スタート時間)
+    const now = new Date();
+    const startTimeStr = `${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}${now.getDate().toString().padStart(2, '0')}_${now.getHours().toString().padStart(2, '0')}${now.getMinutes().toString().padStart(2, '0')}${now.getSeconds().toString().padStart(2, '0')}`;
+    const threadName = `${port}_${startTimeStr}`;
+
+    const thread = await logChannel.threads.create({
+        name: threadName,
+        autoArchiveDuration: 1440, // 24時間でアーカイブ
+        reason: `BDS Port ${port} ログ用`
+    });
+
+    activeThreads[port] = thread.id;
+
+    // 2. プロセスの起動
     const child = spawn(server.path, [], { cwd: server.cwd });
     activeProcesses[port] = child;
     saveState();
 
     const chatChannel = client.channels.cache.get(server.channelId) as TextChannel;
-    const logChannel = client.channels.cache.get(config.logChannelId) as TextChannel;
 
+    // --- 起動通知 ---
     if (chatChannel) {
         chatChannel.send({
-            embeds: [{
-                title: "Server Status",
-                description: `🚀 **Port:${port}** が自動再起動しました。`,
-                color: 0x00ff00
-            }]
+            embeds: [{ title: "Server Status", description: `🚀 **Port:${port}** が起動しました。`, color: 0x00ff00 }]
         }).catch(() => {});
     }
 
-    child.stdout.on('data', (data) => {
-        if (logChannel) {
-            logChannel.send(`\`${new Date().toLocaleString("ja-JP")}\` [**${port}**] \`\`\`\n${data.toString().trim()}\n\`\`\``).catch(() => {});
+    let lineBuffer = "";
+
+    child.stdout.on('data', async (data) => {
+        lineBuffer += data.toString();
+        const lines = lineBuffer.split(/\r?\n/);
+        lineBuffer = lines.pop() || "";
+
+        for (const line of lines) {
+            const cleanLine = line.trim();
+            if (!cleanLine) continue;
+
+            // 3. ログをスレッドに送信
+            try {
+                // キャッシュまたはフェッチでスレッドを取得
+                const logThread = await client.channels.fetch(activeThreads[port]) as any;
+                if (logThread) {
+                    await logThread.send(`\`${new Date().toLocaleTimeString()}\` \`\`\`\n${cleanLine}\n\`\`\``);
+                }
+            } catch (e) {
+                // スレッド送信失敗時はメインのログチャンネルに流す
+                logChannel.send(`[${port}] ${cleanLine}`).catch(() => {});
+            }
+            
+            // 2. 参加・退出の検知 (デバッグログ付き)
+            if (chatChannel) {
+                // BDSのログにはタイムスタンプ等が含まれるため、includes か test が確実です
+                // 参加検知: "Player connected: 名前, xuid: ..."
+                if (cleanLine.includes("Player connected:")) {
+                    console.log(`[DEBUG] Join detected: ${cleanLine}`); // Node.js側に表示
+                    const name = cleanLine.match(/Player connected: ([^,]+)/)?.[1];
+                    if (name) {
+                        chatChannel.send({
+                            embeds: [{
+                                title: "Join",
+                                description: `**${name}** が参加しました。`,
+                                color: 0x00ff00
+                            }]
+                        }).catch(() => {});
+                    }
+                }
+
+                // 退出検知: "Player disconnected: 名前, xuid: ..."
+                if (cleanLine.includes("Player disconnected:")) {
+                    console.log(`[DEBUG] Leave detected: ${cleanLine}`); // Node.js側に表示
+                    const name = cleanLine.match(/Player disconnected: ([^,]+)/)?.[1];
+                    if (name) {
+                        chatChannel.send({
+                            embeds: [{
+                                title: "Leave",
+                                description: `**${name}** が退出しました。`,
+                                color: 0xff0000
+                            }]
+                        }).catch(() => {});
+                    }
+                }
+            }
         }
     });
 
     child.on('close', (code) => {
         delete activeProcesses[port];
+        delete activeThreads[port]; // 終了時に削除
         saveState();
-        if (chatChannel) {
-            chatChannel.send({
-                embeds: [{
-                    title: "Server Status",
-                    description: `🛑 **Port:${port}** が停止しました。`,
-                    color: 0xff0000
-                }]
-            }).catch(() => {});
+        
+        if (thread) {
+            thread.send(`🛑 サーバーが停止しました。 (Code: ${code})`).then(() => {
+                thread.setArchived(true); // スレッドをアーカイブ
+            });
         }
     });
 }
+
+client.once(Events.ClientReady, async (readyClient) => {
+    discoverServers();
+    checkOrphanedProcesses();
+    
+    // 公開用データベースに接続
+    await connectPublicDB();
+    
+    console.log(`🚀 Manager connected to Discord & Public DB`);
+});
 
 // --- Discord ボット処理 ---
 client.on('ready', async () => {
@@ -237,10 +429,22 @@ client.on('ready', async () => {
                                 { type: ApplicationCommandOptionType.String, name: "command", description: "実行内容", required: true }
                             ]
                         },
-                        { 
-                            name: "pull", 
+                        {
+                            name: "pull",
                             type: ApplicationCommandOptionType.Subcommand,
                             description: "behavior_packs内のGit Pullを実行",
+                            options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }]
+                        },
+                        {
+                            name: "backup",
+                            type: ApplicationCommandOptionType.Subcommand,
+                            description: "ワールドデータのバックアップを作成",
+                            options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }]
+                        },
+                        {
+                            name: "backup-list",
+                            type: ApplicationCommandOptionType.Subcommand,
+                            description: "保存済みのバックアップ一覧を表示",
                             options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }]
                         }
                     ]
@@ -275,8 +479,12 @@ client.on('ready', async () => {
                             name: "update-bds",
                             type: ApplicationCommandOptionType.Subcommand,
                             description: "Minecraft BDS本体をアップデート"
+                        },
+                        {
+                            name: "db-check",
+                            type: ApplicationCommandOptionType.Subcommand,
+                            description: "MongoDBの保存データを確認"
                         }
-
                     ]
                 }
             ]
@@ -414,6 +622,43 @@ client.on('interactionCreate', async (interaction) => {
 
             return interaction.editReply({ content: finalMsg });
         }
+
+
+        if (subcommand === "db-check") {
+            await interaction.deferReply();
+            const connState = mongoose.connection.readyState;
+            const states = ["切断", "接続済み", "接続中", "切断中"];
+
+            try {
+                if (connState !== 1) {
+                    return interaction.editReply(`❌ DB未接続 (状態: ${states[connState]})`);
+                }
+
+                // 全データを取得
+                const records = await PublicStatus.find({}).sort({ port: 1 });
+
+                if (records.length === 0) {
+                    return interaction.editReply(`📡 **DB接続**: ✅\n⚠️ まだデータが保存されていません。同期をお待ちください。`);
+                }
+
+                const recordList = records.map((doc: any) => {
+                    return `**Port ${doc.port}**: ${doc.status === 'online' ? "🟢 online" : "🔴 offline"} (${doc.playerCount || 0}人)\n└ 更新: \`${doc.lastUpdate}\``;
+                });
+
+                await interaction.editReply({
+                    embeds: [{
+                        title: "📡 MongoDB 公開データ確認",
+                        description: recordList.join("\n"),
+                        color: 0x00ff00,
+                        footer: { text: "Database: ServerStatus | Collection: RealTimeStatus" },
+                        timestamp: new Date().toISOString()
+                    }]
+                });
+            } catch (err: any) {
+                await interaction.editReply(`❌ 通信エラー: \`\`\`${err.message}\`\`\``);
+            }
+            return;
+        }
     }
 
     // --- Server グループの処理 ---
@@ -425,6 +670,12 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ content: `ポート ${port} のサーバーが見つかりません。`, ephemeral: true });
         }
 
+        if (subcommand === "start") {
+            if (activeProcesses[port]) return interaction.reply("既に起動しています。");
+            await interaction.reply({ content: `サーバー ${port} の起動処理を開始し、専用スレッドを作成しました。`, ephemeral: true });
+            await startServer(port);
+        }
+        /*
         if (subcommand === "start") {
             if (activeProcesses[port]) return interaction.reply("既に起動しています。");
 
@@ -467,13 +718,13 @@ client.on('interactionCreate', async (interaction) => {
             });
 
             return interaction.reply(`サーバー ${port} を起動しました。`);
-        }
+        }*/
 
         if (subcommand === "stop") {
             if (!activeProcesses[port]) return interaction.reply("サーバーが起動していません。");
             
-            sendToConsole(port, "say §e[Discord] 管理者によりサーバーの停止が要請されました。");
-            sendToConsole(port, "say §e[Discord] 5秒後にシャットダウンします。");
+            sendToConsole(port, "say §e[Discord] An administrator has issued a command to stop the server.");
+            sendToConsole(port, "say §e[Discord] The server will shut down in 5 seconds.");
             
             setTimeout(() => sendToConsole(port, "stop"), 5000);
             return interaction.reply(`サーバー ${port} に停止命令を送信しました。`);
@@ -494,6 +745,71 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.deferReply();
             const res = await runGitPull(port);
             return interaction.editReply({ content: res });
+        }
+
+        if (subcommand === "backup") {
+            await interaction.deferReply();
+            const server = detectedServers[port];
+
+            if (!server) return interaction.editReply(`❌ ポート ${port} の設定が見つかりません。`);
+
+            try {
+                // 1. データをフラッシュして保持 (save hold)
+                sendToConsole(port, "save hold");
+                
+                // ログに出力された時間を考慮し、書き出し完了を少し長めに待機
+                await new Promise(resolve => setTimeout(resolve, 5000)); 
+
+                // 2. バックアップ実行 (Promiseが解決されるまでここで待機します)
+                const result = await runBackup(port, server.cwd);
+                sendToConsole(port, "save resume");
+
+                const deltaInfo = result.isFirst ? " (初回バックアップ)" : ` (前回比: \`${result.delta}\`)`;
+                await interaction.editReply(`✅ **バックアップ完了**\n- ファイル: \`${result.fileName}\`\n- サイズ: \`${result.size}\`${deltaInfo}`);
+            } catch (err: any) {
+                // エラーが起きてもサーバーを書き込み可能状態に戻す
+                sendToConsole(port, "save resume"); 
+                console.error(`Backup Error: ${err.message}`);
+                await interaction.editReply(`❌ バックアップ失敗: ${err.message}`);
+            }
+            return;
+        }
+
+        if (subcommand === "backup-list") {
+            await interaction.deferReply();
+            const port = interaction.options.getString("port", true);
+            const backupDir = path.join(process.cwd(), "..", "_backups", port);
+
+            if (!fs.existsSync(backupDir)) {
+                return interaction.editReply(`📂 ポート ${port} のバックアップはまだ作成されていません。`);
+            }
+
+            const files = fs.readdirSync(backupDir)
+                .filter(f => f.endsWith('.zip'))
+                .map(f => {
+                    const stats = fs.statSync(path.join(backupDir, f));
+                    return {
+                        name: f,
+                        size: (stats.size / (1024 * 1024)).toFixed(2) + " MB",
+                        time: stats.mtime
+                    };
+                })
+                .sort((a, b) => b.time.getTime() - a.time.getTime())
+                .slice(0, 10); // 直近10件を表示
+
+            if (files.length === 0) return interaction.editReply(`⚠️ バックアップファイルが見つかりません。`);
+
+            const list = files.map((f, i) => `${i + 1}. \`${f.name}\` (${f.size})`).join("\n");
+
+            await interaction.editReply({
+                embeds: [{
+                    title: `📂 Port ${port} バックアップ履歴 (最新10件)`,
+                    description: list,
+                    color: 0x5865F2,
+                    timestamp: new Date().toISOString()
+                }]
+            });
+            return;
         }
     }
 });
@@ -528,9 +844,38 @@ app.post('/:port/eval', (req, res) => {
     res.sendStatus(200);
 });
 
-app.post('/:port/list', (req, res) => {
-    const { id, players, max } = req.body;
-    idEvent.emit(id, { players, max });
+// --- APIエンドポイント (/:port/list) のデバッグ強化版 ---
+app.post('/:port/list', async (req, res) => {
+    const port = req.params.port;
+    const { players } = req.body;
+
+    if (players === undefined) {
+        return res.sendStatus(400);
+    }
+
+    const count = Number(players);
+    serverStats[port] = count; // メモリを更新
+
+    try {
+        const now = new Date();
+        const timestamp = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+
+        // 10秒周期を待たずに、ここで即座にDBを更新
+        // 人数が届いている＝動いているので status は 'online' 固定で更新
+        await PublicStatus.findOneAndUpdate(
+            { port: port },
+            {
+                status: 'online',
+                playerCount: count,
+                lastUpdate: timestamp
+            },
+            { upsert: true }
+        );
+    } catch (err) {
+        console.error(`❌ DB Direct Update Error [Port ${port}]:`, err);
+    }
+
+    idEvent.emit(req.body.id, { players });
     res.sendStatus(200);
 });
 
@@ -550,24 +895,26 @@ app.post('/:port/join', (req, res) => {
     const port = req.params.port;
     const { player } = req.body;
     const server = detectedServers[port];
+    /*
     if (server) {
         (client.channels.cache.get(server.channelId) as TextChannel).send({
             embeds: [{ title: "Join", description: `**${player}** が参加しました。`, color: 0x00ff00 }]
         });
     }
-    res.sendStatus(200);
+    res.sendStatus(200);*/
 });
 
 app.post('/:port/leave', (req, res) => {
     const port = req.params.port;
     const { player } = req.body;
     const server = detectedServers[port];
+    /*
     if (server) {
         (client.channels.cache.get(server.channelId) as TextChannel).send({
             embeds: [{ title: "Leave", description: `**${player}** が退出しました。`, color: 0xff0000 }]
         });
     }
-    res.sendStatus(200);
+    res.sendStatus(200);*/
 });
 
 app.listen(9000, () => {

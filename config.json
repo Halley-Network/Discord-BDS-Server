@@ -1,12 +1,20 @@
 {
-    "discordToken": "-",
+    "discordToken": "",
     "guildId": "878955580709031956",
-    "usingChannelId": "1069189621096910908",
+    "logChannelId": "1469111225370546199",
+    "servers": {
+        "19132": { "channelId": "1069189621096910908" },
+        "19133": { "channelId": "1232298489925603328" }
+    },
     "commands": {
         "enableNormalCommands": true,
         "opCommands": {
             "enable": true,
             "roleId": "878969359492599839"
         }
-    }
+    },
+    "system": {
+        "gitpull_target": ["TransferServers", "Discord-BDS-Client"]
+    },
+    "mongoUri": ""
 }
