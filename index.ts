@@ -1,4 +1,12 @@
-import { ApplicationCommandOptionType, Client, GuildMemberRoleManager, IntentsBitField, TextChannel, Events } from 'discord.js';
+import {
+    ApplicationCommandOptionType,
+    Client,
+    GuildMemberRoleManager,
+    IntentsBitField,
+    TextChannel,
+    Events,
+    ChatInputApplicationCommandData
+} from 'discord.js';
 import { default as express } from 'express';
 import { default as bodyParser } from "body-parser";
 import { spawn, ChildProcessWithoutNullStreams, exec } from 'child_process';
@@ -6,9 +14,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import EventEmitter from 'events';
 import cors from 'cors';
-import * as config from './config.json';
 import { promisify } from 'util';
 import mongoose from 'mongoose';
+
+// 物理ファイルを読み込み、変数に格納
+let config = JSON.parse(fs.readFileSync(path.resolve(__dirname, './config.json'), 'utf-8'));
 
 const execAsync = promisify(exec);
 const STATE_FILE = './active_servers.json';
@@ -22,6 +32,120 @@ const client = new Client({
 const app = express();
 app.use(bodyParser.json());
 app.use(cors());
+
+// Discordに登録するコマンドリスト
+const DiscordCommandData: ChatInputApplicationCommandData = {
+    name: "admin",
+    description: "BDSマネージャー操作",
+    options: [
+        // グループ1: サーバー操作 (start, stop, eval)
+        {
+            type: ApplicationCommandOptionType.SubcommandGroup,
+            name: "server",
+            description: "特定のサーバーに対する操作",
+            options: [
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "start",
+                    description: "指定したポートのサーバーを起動",
+                    options: [{ type: ApplicationCommandOptionType.String, name: "port", description: "ポート番号", required: true }]
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "stop",
+                    description: "指定したポートのサーバーを停止",
+                    options: [{ type: ApplicationCommandOptionType.String, name: "port", description: "ポート番号", required: true }]
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "eval",
+                    description: "コンソールコマンドを実行",
+                    options: [
+                        { type: ApplicationCommandOptionType.String, name: "port", description: "ポート番号", required: true },
+                        { type: ApplicationCommandOptionType.String, name: "command", description: "実行内容", required: true }
+                    ]
+                },
+                {
+                    name: "pull",
+                    type: ApplicationCommandOptionType.Subcommand,
+                    description: "behavior_packs内のGit Pullを実行 及び tsc -dを実行",
+                    options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }]
+                },
+                {
+                    name: "backup",
+                    type: ApplicationCommandOptionType.Subcommand,
+                    description: "ワールドデータのバックアップを作成",
+                    options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }]
+                },
+                {
+                    name: "backup-list",
+                    type: ApplicationCommandOptionType.Subcommand,
+                    description: "保存済みのバックアップ一覧を表示",
+                    options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }]
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "restart",
+                    description: "サーバーを再起動",
+                    options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }] 
+                }
+            ]
+        },
+        // グループ2: システム操作 (scan, status, monitor)
+        {
+            type: ApplicationCommandOptionType.SubcommandGroup,
+            name: "system",
+            description: "システム全体に関する操作",
+            options: [
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "scan",
+                    description: "フォルダ構成を再スキャン"
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "status",
+                    description: "現在の稼働状況を表示 (一回のみ)"
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "monitor",
+                    description: "稼働状況をリアルタイム監視"
+                },
+                {
+                    name: "pull-all",
+                    type: ApplicationCommandOptionType.Subcommand,
+                    description: "全サーバーのbehavior_packsを一括Git Pull 及び tsc -dを実行"
+                },
+                {
+                    name: "update-bds",
+                    type: ApplicationCommandOptionType.Subcommand,
+                    description: "Minecraft BDS本体をアップデート"
+                },
+                {
+                    name: "db-check",
+                    type: ApplicationCommandOptionType.Subcommand,
+                    description: "MongoDBの保存データを確認"
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "restart-all",
+                    description: "実行中の全サーバーを順次再起動"
+                },
+                {
+                    name: "help",
+                    type: ApplicationCommandOptionType.Subcommand,
+                    description: "利用可能な全コマンドの一覧を表示"
+                },
+                {
+                    name: "reload",
+                    type: ApplicationCommandOptionType.Subcommand,
+                    description: "設定ファイルを再読み込みし、コマンドを同期"
+                }
+            ]
+        }
+    ]
+}
 
 // --- 外部公開用スキーマ ---
 const publicStatusSchema = new mongoose.Schema({
@@ -115,8 +239,26 @@ function checkOrphanedProcesses() {
     }
 }
 
-// --- ユーティリティ ---
+// 特定のポートのサーバーを再起動
+async function restartServer(port: string) {
+    if (activeProcesses[port]) {
+        return new Promise<void>((resolve) => {
+            // プロセスが閉じたら再起動を実行する
+            activeProcesses[port].once('close', async () => {
+                await startServer(port);
+                resolve();
+            });
+            // サーバーに停止命令を送信
+            sendToConsole(port, "stop");
+        });
+    } else {
+        // 動いていない場合はそのまま起動
+        await startServer(port);
+    }
+}
 
+
+// --- ユーティリティ ---
 function getQueue(port: string) {
     if (!messageQueues[port]) messageQueues[port] = [];
     return messageQueues[port];
@@ -171,13 +313,13 @@ function generateStatusEmbed() {
     };
 }
 
-// --- Git Pull を実行する内部関数 ---
+// --- Git Pull & コンパイルを実行する内部関数 ---
 async function runGitPull(port: string): Promise<string> {
     const server = detectedServers[port];
     if (!server) return `Port ${port}: サーバーが見つかりません。`;
 
-    const targets = config.system.gitpull_target;
-    let results = `**[Port ${port} Git Pull]**\n`;
+    const targets = config.system.gitpull_target; 
+    let results = `**[Port ${port} Git Pull & Compilation]**\n`;
 
     for (const folder of targets) {
         const targetPath = path.join(server.cwd, "behavior_packs", folder);
@@ -188,11 +330,61 @@ async function runGitPull(port: string): Promise<string> {
         }
 
         try {
-            // 指定ディレクトリへ移動して git pull を実行
-            const { stdout, stderr } = await execAsync('git pull', { cwd: targetPath });
-            results += `✅ ${folder}: \`${stdout.trim() || "Already up to date."}\`\n`;
+            // 1. Git Pull を実行
+            const { stdout: pullOut } = await execAsync('git pull', { cwd: targetPath });
+            results += `✅ ${folder}: Pull \`${pullOut.trim() || "Already up to date."}\`\n`;
+
+            // 2. config.ts の探索と書き換え
+            const potentialPaths = [
+                path.join(targetPath, "config.ts"),
+                path.join(targetPath, "src", "config.ts"),
+                path.join(targetPath, "scripts", "config.ts")
+            ];
+
+            let fileFound = false;
+            for (const configFilePath of potentialPaths) {
+                if (fs.existsSync(configFilePath)) {
+                    fileFound = true;
+                    const originalContent = fs.readFileSync(configFilePath, 'utf-8');
+                    const updatedContent = originalContent.replace(
+                        /(server_port\s*[:=]\s*)(["']?)\d*(["']?)/g, 
+                        `$1$2${port}$3`
+                    );
+
+                    if (originalContent !== updatedContent) {
+                        fs.writeFileSync(configFilePath, updatedContent, 'utf-8');
+                        results += `   └ 📝 \`${path.relative(targetPath, configFilePath)}\` を \`${port}\` に更新\n`;
+                    }
+                }
+            }
+            if (!fileFound) results += `   ⚠️ config.ts 未検出 (スキップ)\n`;
+
+            // 3. コンパイル処理の追加 ($ tsc -d)
+            results += `   ⏳ コンパイル中 (\`tsc -d\`)...`;
+            try {
+                // 1. 依存関係のインストール（型定義ファイルを揃える）
+                // 初回やリポジトリ更新時に必要です
+                await execAsync('npm install', { cwd: targetPath });
+
+                // 2. コンパイルの実行
+                await execAsync('tsc -d', { cwd: targetPath });
+                results += ` ✅ 成功\n`;
+            } catch (e: any) {
+                // エラー詳細を取得
+                const detail = e.stdout || e.message;
+                
+                // JSファイルが生成されていれば「成功」とみなす
+                // (scripts/index.js など、ビルド後のパスに合わせて調整してください)
+                const jsPath = path.join(targetPath, "scripts", "index.js"); 
+                if (fs.existsSync(jsPath)) {
+                    results += ` ✅ 成功 (型エラー ${e.code} は無視されました)\n`;
+                } else {
+                    results += ` ❌ 失敗: \n\`\`\`\n${detail.substring(0, 300)}...\n\`\`\`\n`;
+                }
+            }
+
         } catch (error: any) {
-            results += `❌ ${folder}: エラー発生\n\`\`\`${error.message}\`\`\`\n`;
+            results += `❌ ${folder}: 重大なエラー発生\n\`\`\`${error.message}\`\`\`\n`;
         }
     }
     return results;
@@ -336,7 +528,6 @@ async function startServer(port: string) {
                 // BDSのログにはタイムスタンプ等が含まれるため、includes か test が確実です
                 // 参加検知: "Player connected: 名前, xuid: ..."
                 if (cleanLine.includes("Player connected:")) {
-                    console.log(`[DEBUG] Join detected: ${cleanLine}`); // Node.js側に表示
                     const name = cleanLine.match(/Player connected: ([^,]+)/)?.[1];
                     if (name) {
                         chatChannel.send({
@@ -351,7 +542,6 @@ async function startServer(port: string) {
 
                 // 退出検知: "Player disconnected: 名前, xuid: ..."
                 if (cleanLine.includes("Player disconnected:")) {
-                    console.log(`[DEBUG] Leave detected: ${cleanLine}`); // Node.js側に表示
                     const name = cleanLine.match(/Player disconnected: ([^,]+)/)?.[1];
                     if (name) {
                         chatChannel.send({
@@ -369,13 +559,25 @@ async function startServer(port: string) {
 
     child.on('close', (code) => {
         delete activeProcesses[port];
-        delete activeThreads[port]; // 終了時に削除
+        delete activeThreads[port];
         saveState();
         
+        if (chatChannel) {
+            chatChannel.send({
+                embeds: [{
+                    title: "Server Status",
+                    description: `🛑 **Port:${port}** が完全に停止しました。(Code: ${code})\n※再起動の場合は、この後すぐに起動通知が流れます。`,
+                    color: 0xff0000 // 赤色
+                }]
+            }).catch(() => {});
+        }
+
         if (thread) {
-            thread.send(`🛑 サーバーが停止しました。 (Code: ${code})`).then(() => {
-                thread.setArchived(true); // スレッドをアーカイブ
-            });
+            thread.send(`🛑 サーバーが停止しました。 (Code: ${code})`)
+                .then(() => {
+                    thread.setArchived(true).catch(() => {});
+                })
+                .catch(() => {});
         }
     });
 }
@@ -397,99 +599,7 @@ client.on('ready', async () => {
     console.log(`🚀 Manager logged in as ${client.user!.tag}`);
     
     // コマンド登録：2つのグループを作成
-    await client.application!.commands.set([
-        {
-            name: "admin",
-            description: "BDSマネージャー操作",
-            options: [
-                // グループ1: サーバー操作 (start, stop, eval)
-                {
-                    type: ApplicationCommandOptionType.SubcommandGroup,
-                    name: "server",
-                    description: "特定のサーバーに対する操作",
-                    options: [
-                        {
-                            type: ApplicationCommandOptionType.Subcommand,
-                            name: "start",
-                            description: "指定したポートのサーバーを起動",
-                            options: [{ type: ApplicationCommandOptionType.String, name: "port", description: "ポート番号", required: true }]
-                        },
-                        {
-                            type: ApplicationCommandOptionType.Subcommand,
-                            name: "stop",
-                            description: "指定したポートのサーバーを停止",
-                            options: [{ type: ApplicationCommandOptionType.String, name: "port", description: "ポート番号", required: true }]
-                        },
-                        {
-                            type: ApplicationCommandOptionType.Subcommand,
-                            name: "eval",
-                            description: "コンソールコマンドを実行",
-                            options: [
-                                { type: ApplicationCommandOptionType.String, name: "port", description: "ポート番号", required: true },
-                                { type: ApplicationCommandOptionType.String, name: "command", description: "実行内容", required: true }
-                            ]
-                        },
-                        {
-                            name: "pull",
-                            type: ApplicationCommandOptionType.Subcommand,
-                            description: "behavior_packs内のGit Pullを実行",
-                            options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }]
-                        },
-                        {
-                            name: "backup",
-                            type: ApplicationCommandOptionType.Subcommand,
-                            description: "ワールドデータのバックアップを作成",
-                            options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }]
-                        },
-                        {
-                            name: "backup-list",
-                            type: ApplicationCommandOptionType.Subcommand,
-                            description: "保存済みのバックアップ一覧を表示",
-                            options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }]
-                        }
-                    ]
-                },
-                // グループ2: システム操作 (scan, status, monitor)
-                {
-                    type: ApplicationCommandOptionType.SubcommandGroup,
-                    name: "system",
-                    description: "システム全体に関する操作",
-                    options: [
-                        {
-                            type: ApplicationCommandOptionType.Subcommand,
-                            name: "scan",
-                            description: "フォルダ構成を再スキャン"
-                        },
-                        {
-                            type: ApplicationCommandOptionType.Subcommand,
-                            name: "status",
-                            description: "現在の稼働状況を表示 (一回のみ)"
-                        },
-                        {
-                            type: ApplicationCommandOptionType.Subcommand,
-                            name: "monitor",
-                            description: "稼働状況をリアルタイム監視 (旧 status-live)"
-                        },
-                        {
-                            name: "pull-all",
-                            type: ApplicationCommandOptionType.Subcommand,
-                            description: "全サーバーのbehavior_packsを一括Git Pull"
-                        },
-                        {
-                            name: "update-bds",
-                            type: ApplicationCommandOptionType.Subcommand,
-                            description: "Minecraft BDS本体をアップデート"
-                        },
-                        {
-                            name: "db-check",
-                            type: ApplicationCommandOptionType.Subcommand,
-                            description: "MongoDBの保存データを確認"
-                        }
-                    ]
-                }
-            ]
-        }
-    ], config.guildId);
+    await client.application!.commands.set([DiscordCommandData], config.guildId);
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -507,82 +617,80 @@ client.on('interactionCreate', async (interaction) => {
 
     // --- System グループの処理 ---
     if (group === "system") {
-        if (group === "system") {
-            if (subcommand === "update-bds") {
-                await interaction.deferReply();
+        if (subcommand === "update-bds") {
+            await interaction.deferReply();
 
-                const rootDir = path.join(process.cwd(), "..");
-                const updaterPath = path.join(rootDir, "BDS-Updater", "src", "DownloadBDS.js");
-                const logFileName = `update_log_${Date.now()}.txt`;
+            const rootDir = path.join(process.cwd(), "..");
+            const updaterPath = path.join(rootDir, "BDS-Updater", "src", "DownloadBDS.js");
+            const logFileName = `update_log_${Date.now()}.txt`;
 
-                if (!fs.existsSync(updaterPath)) {
-                    return interaction.editReply(`❌ アップデーターが見つかりません。`);
-                }
-
-                // 1. 現在起動しているサーバーを記録
-                const runningPorts = Object.keys(activeProcesses);
-                
-                if (runningPorts.length > 0) {
-                    await interaction.editReply(`⏳ 稼働中のサーバー (${runningPorts.join(", ")}) を停止してからアップデートを開始します...`);
-
-                    // 全てのサーバーが閉じるのを待機するPromise配列
-                    const stopPromises = runningPorts.map(port => {
-                        return new Promise<void>((resolve) => {
-                            const proc = activeProcesses[port];
-                            if (proc) {
-                                proc.once('close', () => resolve());
-                                sendToConsole(port, "stop"); // 停止命令
-                            } else {
-                                resolve();
-                            }
-                        });
-                    });
-
-                    await Promise.all(stopPromises);
-                    await interaction.editReply(`✅ 全サーバーの停止を確認。アップデートを実行中...`);
-                }
-
-                // 2. アップデート実行 (spawnによるストリーム方式)
-                try {
-                    const logStream = fs.createWriteStream(logFileName);
-                    let fullOutput = "";
-                    const updaterProcess = spawn('node', [updaterPath]);
-
-                    updaterProcess.stdout.on('data', (data) => {
-                        logStream.write(data);
-                        fullOutput += data.toString();
-                    });
-
-                    updaterProcess.stderr.on('data', (data) => {
-                        logStream.write(`[ERR] ${data}`);
-                    });
-
-                    updaterProcess.on('close', async (code) => {
-                        logStream.end();
-
-                        const isSuccess = fullOutput.includes("All tasks completed!");
-                        
-                        // 3. 元々動いていたサーバーのみ再起動
-                        if (isSuccess && code === 0) {
-                            await interaction.followUp(`✅ アップデート成功。元々稼働していたサーバー (${runningPorts.join(", ") || "なし"}) を再起動します。`);
-                            for (const port of runningPorts) {
-                                startServer(port);
-                            }
-                        }
-
-                        await interaction.editReply({
-                            content: `📦 **アップデート処理終了** (Code: ${code})\n結果はログファイルを確認してください。`,
-                            files: [logFileName]
-                        });
-
-                        if (fs.existsSync(logFileName)) fs.unlinkSync(logFileName);
-                    });
-
-                } catch (error: any) {
-                    await interaction.editReply(`❌ 致命的なエラー: ${error.message}`);
-                }
-                return;
+            if (!fs.existsSync(updaterPath)) {
+                return interaction.editReply(`❌ アップデーターが見つかりません。`);
             }
+
+            // 1. 現在起動しているサーバーを記録
+            const runningPorts = Object.keys(activeProcesses);
+
+            if (runningPorts.length > 0) {
+                await interaction.editReply(`⏳ 稼働中のサーバー (${runningPorts.join(", ")}) を停止してからアップデートを開始します...`);
+
+                // 全てのサーバーが閉じるのを待機するPromise配列
+                const stopPromises = runningPorts.map(port => {
+                    return new Promise<void>((resolve) => {
+                        const proc = activeProcesses[port];
+                        if (proc) {
+                            proc.once('close', () => resolve());
+                            sendToConsole(port, "stop"); // 停止命令
+                        } else {
+                            resolve();
+                        }
+                    });
+                });
+
+                await Promise.all(stopPromises);
+                await interaction.editReply(`✅ 全サーバーの停止を確認。アップデートを実行中...`);
+            }
+
+            // 2. アップデート実行 (spawnによるストリーム方式)
+            try {
+                const logStream = fs.createWriteStream(logFileName);
+                let fullOutput = "";
+                const updaterProcess = spawn('node', [updaterPath]);
+
+                updaterProcess.stdout.on('data', (data) => {
+                    logStream.write(data);
+                    fullOutput += data.toString();
+                });
+
+                updaterProcess.stderr.on('data', (data) => {
+                    logStream.write(`[ERR] ${data}`);
+                });
+
+                updaterProcess.on('close', async (code) => {
+                    logStream.end();
+
+                    const isSuccess = fullOutput.includes("All tasks completed!");
+                    
+                    // 3. 元々動いていたサーバーのみ再起動
+                    if (isSuccess && code === 0) {
+                        await interaction.followUp(`✅ アップデート成功。元々稼働していたサーバー (${runningPorts.join(", ") || "なし"}) を再起動します。`);
+                        for (const port of runningPorts) {
+                            startServer(port);
+                        }
+                    }
+
+                    await interaction.editReply({
+                        content: `📦 **アップデート処理終了** (Code: ${code})\n結果はログファイルを確認してください。`,
+                        files: [logFileName]
+                    });
+
+                    if (fs.existsSync(logFileName)) fs.unlinkSync(logFileName);
+                });
+
+            } catch (error: any) {
+                await interaction.editReply(`❌ 致命的なエラー: ${error.message}`);
+            }
+            return;
         }
 
         if (subcommand === "scan") {
@@ -659,6 +767,131 @@ client.on('interactionCreate', async (interaction) => {
             }
             return;
         }
+
+        if (subcommand === "restart-all") {
+            const runningPorts = Object.keys(activeProcesses);
+            
+            if (runningPorts.length === 0) {
+                return interaction.reply({ content: "⚠️ 現在実行中のサーバーはありません。", ephemeral: true });
+            }
+
+            await interaction.reply({ content: `🔄 実行中の ${runningPorts.length} 個のサーバーを順次再起動します...`, ephemeral: true });
+
+            for (const p of runningPorts) {
+                await restartServer(p);
+                // 負荷分散のため、次の再起動まで少し待機（任意）
+                await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+        }
+
+        if (subcommand === "help") {
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                // --- 1. システム構成情報の取得 ---
+                const guildName = interaction.guild?.name || "不明なサーバー";
+                const logChannel = `<#${config.logChannelId}>`;
+                
+                // 各サーバーのチャンネル設定
+                const serverChannels = Object.entries(config.servers)
+                    .map(([port, data]: [string, any]) => `・Port **${port}**: <#${data.channelId}>`)
+                    .join("\n") || "未設定";
+
+                // Gitリポジトリ名
+                const gitRepos = config.system.gitpull_target
+                    .map((repo: string) => `\`${repo}\``)
+                    .join(", ") || "なし";
+
+                // --- 2. コマンド一覧の生成 (スクリーンショット形式) ---
+                const commands = await interaction.guild?.commands.fetch();
+                let commandManual = "利用可能なコマンド一覧です：\n\n";
+
+                if (commands && commands.size > 0) {
+                    commands.forEach(cmd => {
+                        commandManual += `**/${cmd.name}** - ${cmd.description}\n`;
+
+                        if (cmd.options) {
+                            cmd.options.forEach(opt => {
+                                // SubcommandGroup (server, system など)
+                                if (opt.type === ApplicationCommandOptionType.SubcommandGroup) {
+                                    commandManual += `└ **${opt.name}** (Group)\n`;
+                                    opt.options?.forEach(sub => {
+                                        commandManual += `　└ \`/${cmd.name} ${opt.name} ${sub.name}\` - ${sub.description}\n`;
+                                    });
+                                } 
+                                // Top-level Subcommand
+                                else if (opt.type === ApplicationCommandOptionType.Subcommand) {
+                                    commandManual += `└ \`/${cmd.name} ${opt.name}\` - ${opt.description}\n`;
+                                }
+                            });
+                        }
+                        commandManual += "\n";
+                    });
+                }
+
+                // --- 3. 埋め込みメッセージの構築 ---
+                await interaction.editReply({
+                    embeds: [{
+                        title: "📖 コマンドマニュアル (自動生成)",
+                        color: 0x00AAAA, // 制御工学の図面のような落ち着いた青色
+                        fields: [
+                            {
+                                name: "🌐 サーバー情報",
+                                value: `**サーバー名**: ${guildName}\n**ID**: \`${config.guildId}\``,
+                                inline: true
+                            },
+                            {
+                                name: "📜 ログ・リポジトリ",
+                                value: `**ログ**: ${logChannel}\n**Git**: ${gitRepos}`,
+                                inline: true
+                            },
+                            {
+                                name: "🎮 サーバー別チャンネル",
+                                value: serverChannels,
+                                inline: false
+                            },
+                            {
+                                name: "🛠️ 利用可能なコマンド",
+                                value: commandManual,
+                                inline: false
+                            }
+                        ],
+                        footer: { text: "※新しいコマンドは reload 後に反映されます" },
+                        timestamp: new Date().toISOString()
+                    }]
+                });
+
+            } catch (err: any) {
+                console.error("Help Command Error:", err);
+                await interaction.editReply(`❌ ヘルプ生成エラー: \`${err.message}\``);
+            }
+            return;
+        }
+
+
+        if (subcommand === "reload") {
+            await interaction.deferReply({ ephemeral: true });
+
+            try {
+                const configPath = path.resolve(__dirname, './config.json');
+                const rawConfig = fs.readFileSync(configPath, 'utf-8');
+                const newConfig = JSON.parse(rawConfig);
+                config = newConfig;
+
+                discoverServers();
+
+                // --- 修正後：変数 DiscordCommandData を配列として再利用する ---
+                await client.application!.commands.set([DiscordCommandData], config.guildId);
+
+                await interaction.editReply(`✅ **リロード成功**\n- サーバー数: ${Object.keys(detectedServers).length}\n- 設定とコマンドを同期しました。`);
+                console.log("♻️ Configuration reloaded successfully.");
+
+            } catch (err: any) {
+                console.error("Reload Error:", err);
+                await interaction.editReply(`❌ リロード失敗: \`${err.message}\``);
+            }
+            return;
+        }
     }
 
     // --- Server グループの処理 ---
@@ -675,56 +908,26 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.reply({ content: `サーバー ${port} の起動処理を開始し、専用スレッドを作成しました。`, ephemeral: true });
             await startServer(port);
         }
-        /*
-        if (subcommand === "start") {
-            if (activeProcesses[port]) return interaction.reply("既に起動しています。");
 
-            const child = spawn(server.path, [], { cwd: server.cwd });
-            activeProcesses[port] = child;
-            saveState();
+        if (subcommand === "stop") {
+            if (!activeProcesses[port]) return interaction.reply("サーバーが起動していません。");
 
-            // チャットチャンネルへの通知
+            const server = detectedServers[port];
             const chatChannel = client.channels.cache.get(server.channelId) as TextChannel;
+
+            // 1. チャットチャンネルへ停止メッセージを送信
             if (chatChannel) {
                 chatChannel.send({
                     embeds: [{
                         title: "Server Status",
-                        description: `🚀 **Port:${port}** が起動しました。`,
-                        color: 0x00ff00
+                        description: `🛑 **Port:${port}** の停止処理を開始しました。`,
+                        color: 0xffa500 // オレンジ
                     }]
-                }).catch(e => console.error("Start msg failed", e));
+                }).catch(() => {});
             }
 
-            // ログチャンネルへの転送
-            child.stdout.on('data', (data) => {
-                const logChannel = client.channels.cache.get(config.logChannelId) as TextChannel;
-                if (logChannel) {
-                    logChannel.send(`\`${new Date().toLocaleString("ja-JP")}\` [**${port}**] \`\`\`\n${data.toString().trim()}\n\`\`\``).catch(()=>{});
-                }
-            });
-
-            child.on('close', (code) => {
-                delete activeProcesses[port];
-                saveState();
-                if (chatChannel) {
-                    chatChannel.send({
-                        embeds: [{
-                            title: "Server Status",
-                            description: `🛑 **Port:${port}** が停止しました。(Code: ${code})`,
-                            color: 0xff0000
-                        }]
-                    }).catch(e => console.error("Stop msg failed", e));
-                }
-            });
-
-            return interaction.reply(`サーバー ${port} を起動しました。`);
-        }*/
-
-        if (subcommand === "stop") {
-            if (!activeProcesses[port]) return interaction.reply("サーバーが起動していません。");
-            
             sendToConsole(port, "say §e[Discord] An administrator has issued a command to stop the server.");
-            sendToConsole(port, "say §e[Discord] The server will shut down in 5 seconds.");
+            sendToConsole(port, "say §e[Discord] The server will shut down in 5 seconds.");            
             
             setTimeout(() => sendToConsole(port, "stop"), 5000);
             return interaction.reply(`サーバー ${port} に停止命令を送信しました。`);
@@ -810,6 +1013,34 @@ client.on('interactionCreate', async (interaction) => {
                 }]
             });
             return;
+        }
+
+        if (subcommand === "restart") {
+            if (!activeProcesses[port]) return interaction.reply("サーバーが起動していないため、通常起動します。");
+
+            const server = detectedServers[port];
+            const chatChannel = client.channels.cache.get(server.channelId) as TextChannel;
+
+            // 2. チャットチャンネルへ再起動メッセージを送信
+            if (chatChannel) {
+                chatChannel.send({
+                    embeds: [{
+                        title: "Server Status",
+                        description: `🔄 **Port:${port}** の再起動シーケンスを開始しました。`,
+                        color: 0xffff00 // 黄色
+                    }]
+                }).catch(() => {});
+            }
+
+            sendToConsole(port, "say §e[Discord] Restart the server.");
+
+            await interaction.reply({ content: `🔄 Port ${port} の再起動を開始しました。`, ephemeral: true });
+
+            // 再起動ロジック：停止を待ってから開始
+            activeProcesses[port].once('close', () => {
+                startServer(port);
+            });
+            sendToConsole(port, "stop");
         }
     }
 });
@@ -915,6 +1146,29 @@ app.post('/:port/leave', (req, res) => {
         });
     }
     res.sendStatus(200);*/
+});
+
+app.get('/:port/status-of/:targetPort', async (req, res) => {
+    const targetPort = req.params.targetPort;
+
+    try {
+        // 特定のポートの情報を検索
+        const record = await PublicStatus.findOne({ port: targetPort });
+
+        if (!record) {
+            return res.status(404).json({ error: "Server not found" });
+        }
+
+        res.json({
+            port: record.port,
+            status: record.status,
+            count: record.playerCount,
+            lastUpdate: record.lastUpdate
+        });
+    } catch (err) {
+        console.error("❌ Single-status API Error:", err);
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
 app.listen(9000, () => {
