@@ -3,3 +3,5 @@ node_modules/*
 *.d.ts
 config.json
 bedrock_server/*
+active_servers.json
+config.json

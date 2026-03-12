@@ -29,6 +29,10 @@ const client = new Client({
         IntentsBitField.Flags.MessageContent
     ]
 });
+
+// 実行中のモニター更新を管理する変数
+let currentMonitorInterval: NodeJS.Timeout | null = null;
+
 const app = express();
 app.use(bodyParser.json());
 app.use(cors());
@@ -302,7 +306,12 @@ function discoverServers() {
 function generateStatusEmbed() {
     const list = Object.keys(detectedServers).map(p => {
         const active = activeProcesses[p] !== undefined;
-        return `**Port ${p}**: ${active ? "🟢 起動中" : "🔴 停止中"} ${active ? `(PID: \`${activeProcesses[p].pid}\`)` : ""}`;
+        const threadId = activeThreads[p]; // 起動中のスレッドIDを取得
+        
+        // 起動中の場合のみ、スレッドへのリンクを表示
+        const threadLink = (active && threadId) ? `\n　└ ログ: <#${threadId}>` : "";
+        
+        return `**Port ${p}**: ${active ? "🟢 起動中" : "🔴 停止中"}${threadLink}`;
     });
 
     return {
@@ -703,18 +712,32 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (subcommand === "monitor") {
+            // 1. もし既に実行中のモニターがあれば停止させる（最新のみを動かすため）
+            if (currentMonitorInterval) {
+                clearInterval(currentMonitorInterval);
+                currentMonitorInterval = null;
+            }
+
+            // 2. 初回応答
             await interaction.reply({ 
-                embeds: [generateStatusEmbed()], 
-                withResponse: true // 非推奨警告回避
+                embeds: [generateStatusEmbed()] 
             });
 
-            const interval = setInterval(async () => {
+            // 3. 10秒ごとの自動更新を開始
+            currentMonitorInterval = setInterval(async () => {
                 try {
-                    await interaction.editReply({ embeds: [generateStatusEmbed()] });
+                    // 最新のメッセージ（現在の interaction）のみを更新
+                    await interaction.editReply({ 
+                        embeds: [generateStatusEmbed()] 
+                    });
                 } catch (error) {
-                    clearInterval(interval);
+                    // メッセージが削除されたり、エラーが起きた場合はタイマーを破棄
+                    if (currentMonitorInterval) {
+                        clearInterval(currentMonitorInterval);
+                        currentMonitorInterval = null;
+                    }
                 }
-            }, 10000);
+            }, 10000); // 10秒間隔
             return;
         }
 
