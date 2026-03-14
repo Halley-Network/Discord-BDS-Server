@@ -92,6 +92,12 @@ const DiscordCommandData: ChatInputApplicationCommandData = {
                     name: "restart",
                     description: "サーバーを再起動",
                     options: [{ type: ApplicationCommandOptionType.String, name: "port", required: true, description: "ポート番号" }] 
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "user-list",
+                    description: "指定したポートの参加者一覧を表示",
+                    options: [{ type: ApplicationCommandOptionType.String, name: "port", description: "ポート番号", required: true }]
                 }
             ]
         },
@@ -156,6 +162,7 @@ const publicStatusSchema = new mongoose.Schema({
     port: { type: String, required: true, unique: true },
     status: { type: String, enum: ['online', 'offline'], required: true },
     playerCount: { type: Number, default: 0 }, // 現在の人数のみ保持
+    playerNames: { type: [String], default: [] },
     lastUpdate: { type: String, required: true }
 });
 const PublicStatus = mongoose.model('PublicStatus', publicStatusSchema, 'RealTimeStatus');
@@ -979,22 +986,60 @@ client.on('interactionCreate', async (interaction) => {
 
             if (!server) return interaction.editReply(`❌ ポート ${port} の設定が見つかりません。`);
 
+            const chatChannel = client.channels.cache.get(server.channelId) as TextChannel;
+
             try {
-                // 1. データをフラッシュして保持 (save hold)
-                sendToConsole(port, "save hold");
+                // --- 1. バックアップ開始の通知 ---
+                // Minecraft 内へ通知
+                sendToConsole(port, "say §e[Backup] World backup starting. Writing will be paused...");
                 
-                // ログに出力された時間を考慮し、書き出し完了を少し長めに待機
+                // Discord 内へ通知（チャット用チャンネル）
+                if (chatChannel) {
+                    chatChannel.send({
+                        embeds: [{
+                            title: "💾 Backup Status",
+                            description: `🔄 **Port:${port}** のバックアップ処理を開始しました。`,
+                            color: 0xffa500 // オレンジ
+                        }]
+                    }).catch(() => {});
+                }
+
+                // データのフラッシュと保持
+                sendToConsole(port, "save hold");
                 await new Promise(resolve => setTimeout(resolve, 5000)); 
 
-                // 2. バックアップ実行 (Promiseが解決されるまでここで待機します)
+                // --- 2. バックアップ実行 ---
                 const result = await runBackup(port, server.cwd);
+
+                // --- 3. バックアップ終了の通知 ---
+                // 書き込み再開命令
                 sendToConsole(port, "save resume");
 
-                const deltaInfo = result.isFirst ? " (初回バックアップ)" : ` (前回比: \`${result.delta}\`)`;
-                await interaction.editReply(`✅ **バックアップ完了**\n- ファイル: \`${result.fileName}\`\n- サイズ: \`${result.size}\`${deltaInfo}`);
+                // Minecraft 内へ完了通知
+                sendToConsole(port, `say §a[Backup] Backup completed successfully. (Size: ${result.size})`);
+
+                const deltaInfo = result.isFirst ? " (初回)" : ` (前回比: \`${result.delta}\`)`;
+                const successMsg = `✅ **バックアップ完了**\n- ファイル: \`${result.fileName}\`\n- サイズ: \`${result.size}\`${deltaInfo}`;
+
+                // Discord（コマンド実行者への返信）
+                await interaction.editReply(successMsg);
+
+                // Discord（チャット用チャンネルへ完了通知）
+                if (chatChannel) {
+                    chatChannel.send({
+                        embeds: [{
+                            title: "💾 Backup Status",
+                            description: `✅ **Port:${port}** のバックアップが完了しました。\n${successMsg}`,
+                            color: 0x00ff00 // 緑
+                        }]
+                    }).catch(() => {});
+                }
+
             } catch (err: any) {
-                // エラーが起きてもサーバーを書き込み可能状態に戻す
+                // エラー発生時の安全装置
                 sendToConsole(port, "save resume"); 
+                sendToConsole(port, "say §c[Backup] バックアップ中にエラーが発生しました。");
+                
                 console.error(`Backup Error: ${err.message}`);
                 await interaction.editReply(`❌ バックアップ失敗: ${err.message}`);
             }
@@ -1065,6 +1110,69 @@ client.on('interactionCreate', async (interaction) => {
             });
             sendToConsole(port, "stop");
         }
+
+        if (subcommand === "user-list") {
+            await interaction.deferReply();
+            const port = interaction.options.getString("port", true);
+            const server = detectedServers[port];
+
+            try {
+                // 1. MongoDB から最新のプレイヤー名リストを取得
+                const record = await PublicStatus.findOne({ port: port });
+                
+                if (!record || record.status === 'offline') {
+                    return interaction.editReply(`❌ Port ${port} はオフライン、またはデータがありません。`);
+                }
+
+                // 2. server.properties から最大人数を取得
+                let maxPlayers = "不明";
+                if (server) {
+                    const propPath = path.join(server.cwd, "server.properties");
+                    if (fs.existsSync(propPath)) {
+                        const content = fs.readFileSync(propPath, 'utf-8');
+                        const match = content.match(/max-players=(\d+)/);
+                        if (match) maxPlayers = match[1];
+                    }
+                }
+
+                // 3. プレイヤー一覧の整形
+                const playerNames = record.playerNames && record.playerNames.length > 0 
+                    ? record.playerNames.join("\n") 
+                    : "参加中のプレイヤーはいません。";
+
+                // 4. Discord 埋め込みメッセージの送信
+                await interaction.editReply({
+                    embeds: [{
+                        title: `👥 参加者リスト - Port ${port}`,
+                        color: 0x00FF7F, // 春の緑色
+                        fields: [
+                            {
+                                name: "📊 接続状況",
+                                value: `**${record.playerCount}** / **${maxPlayers}** 人`,
+                                inline: true
+                            },
+                            {
+                                name: "🕒 最終同期",
+                                value: `<t:${Math.floor(new Date(record.lastUpdate).getTime() / 1000)}:R>`,
+                                inline: true
+                            },
+                            {
+                                name: "👤 参加中のプレイヤー",
+                                value: `\`\`\`\n${playerNames}\n\`\`\``,
+                                inline: false
+                            }
+                        ],
+                        footer: { text: "※10秒周期で更新されるDB値を参照しています" },
+                        timestamp: new Date().toISOString()
+                    }]
+                });
+
+            } catch (err: any) {
+                console.error("User List Error:", err);
+                await interaction.editReply(`❌ データの取得中にエラーが発生しました: \`${err.message}\``);
+            }
+            return;
+        }
     }
 });
 
@@ -1101,7 +1209,8 @@ app.post('/:port/eval', (req, res) => {
 // --- APIエンドポイント (/:port/list) のデバッグ強化版 ---
 app.post('/:port/list', async (req, res) => {
     const port = req.params.port;
-    const { players } = req.body;
+    // req.body から players と names を受け取るように拡張
+    const { players, names, id } = req.body;
 
     if (players === undefined) {
         return res.sendStatus(400);
@@ -1115,12 +1224,12 @@ app.post('/:port/list', async (req, res) => {
         const timestamp = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
 
         // 10秒周期を待たずに、ここで即座にDBを更新
-        // 人数が届いている＝動いているので status は 'online' 固定で更新
         await PublicStatus.findOneAndUpdate(
             { port: port },
             {
                 status: 'online',
                 playerCount: count,
+                playerNames: names || [], // ★ 名前リストをDBに保存
                 lastUpdate: timestamp
             },
             { upsert: true }
@@ -1129,7 +1238,8 @@ app.post('/:port/list', async (req, res) => {
         console.error(`❌ DB Direct Update Error [Port ${port}]:`, err);
     }
 
-    idEvent.emit(req.body.id, { players });
+    // 元のロジックを維持：イベントを通知して200を返す
+    idEvent.emit(id, { players });
     res.sendStatus(200);
 });
 
@@ -1171,6 +1281,25 @@ app.post('/:port/leave', (req, res) => {
     res.sendStatus(200);*/
 });
 
+app.post('/:port/list', async (req, res) => {
+    const port = req.params.port;
+    const { players, names } = req.body; // ★ names を受け取る
+
+    try {
+        await PublicStatus.findOneAndUpdate(
+            { port: port },
+            {
+                status: 'online',
+                playerCount: Number(players),
+                playerNames: names || [], // ★ 保存
+                lastUpdate: new Date().toLocaleString("ja-JP")
+            },
+            { upsert: true }
+        );
+    } catch (err) { console.error(err); }
+    res.sendStatus(200);
+});
+
 app.get('/:port/status-of/:targetPort', async (req, res) => {
     const targetPort = req.params.targetPort;
 
@@ -1192,6 +1321,33 @@ app.get('/:port/status-of/:targetPort', async (req, res) => {
         console.error("❌ Single-status API Error:", err);
         res.status(500).json({ error: "DB Error" });
     }
+});
+
+app.get('/:port/user-list/:targetPort', async (req, res) => {
+    const targetPort = req.params.targetPort;
+    const server = detectedServers[targetPort];
+
+    try {
+        const record = await PublicStatus.findOne({ port: targetPort });
+        if (!record) return res.status(404).json({ error: "No data" });
+
+        // server.properties から最大人数を取得
+        let maxPlayers = "不明";
+        if (server) {
+            const propPath = path.join(server.cwd, "server.properties");
+            if (fs.existsSync(propPath)) {
+                const content = fs.readFileSync(propPath, 'utf-8');
+                const match = content.match(/max-players=(\d+)/);
+                if (match) maxPlayers = match[1];
+            }
+        }
+
+        res.json({
+            names: record.playerNames,
+            count: record.playerCount,
+            max: maxPlayers
+        });
+    } catch (err) { res.status(500).send(err); }
 });
 
 app.listen(9000, () => {
