@@ -151,6 +151,11 @@ const DiscordCommandData: ChatInputApplicationCommandData = {
                     name: "reload",
                     type: ApplicationCommandOptionType.Subcommand,
                     description: "設定ファイルを再読み込みし、コマンドを同期"
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "reconnect-db",
+                    description: "データベースへの再接続を手動で実行します"
                 }
             ]
         }
@@ -188,6 +193,39 @@ async function connectPublicDB() {
         setInterval(updatePublicStatus, 10000);
     } catch (err) {
         console.error("❌ MongoDB connection error:", err);
+    }
+}
+
+/**
+ * MongoDB への接続（および再接続）を管理する関数
+ */
+async function connectDB(): Promise<{ success: boolean; message: string }> {
+    try {
+        // 既存の接続があれば一度切app.post('/:port/list'断する
+        if (mongoose.connection.readyState !== 0) {
+            await mongoose.disconnect();
+        }
+        
+        await mongoose.connect(config.mongoUri);
+        console.log("✅ MongoDB 接続成功");
+        return { success: true, message: "データベースに正常に接続されました。" };
+    } catch (err: any) {
+        const errorMsg = `❌ DB 接続失敗: ${err.message}`;
+        console.error(errorMsg);
+        
+        // ログチャンネルにエラーを送信
+        const logChannel = client.channels.cache.get(config.logChannelId) as TextChannel;
+        if (logChannel) {
+            logChannel.send({
+                embeds: [{
+                    title: "🚨 データベース接続エラー",
+                    description: `\`\`\`\n${err.stack || err.message}\n\`\`\``,
+                    color: 0xff0000,
+                    timestamp: new Date().toISOString()
+                }]
+            }).catch(() => {});
+        }
+        return { success: false, message: errorMsg };
     }
 }
 
@@ -922,6 +960,19 @@ client.on('interactionCreate', async (interaction) => {
             }
             return;
         }
+
+        if (subcommand === "reconnect-db") {
+            await interaction.deferReply();
+            
+            const result = await connectDB();
+            
+            if (result.success) {
+                await interaction.editReply({ content: `✅ **Success:** ${result.message}` });
+            } else {
+                await interaction.editReply({ content: `❌ **Failed:** ${result.message}\nログチャンネルに詳細を出力しました。` });
+            }
+            return;
+        }
     }
 
     // --- Server グループの処理 ---
@@ -1209,7 +1260,7 @@ app.post('/:port/eval', (req, res) => {
 // --- APIエンドポイント (/:port/list) のデバッグ強化版 ---
 app.post('/:port/list', async (req, res) => {
     const port = req.params.port;
-    // req.body から players と names を受け取るように拡張
+    // req.body から players, names, id を受け取る
     const { players, names, id } = req.body;
 
     if (players === undefined) {
@@ -1217,28 +1268,40 @@ app.post('/:port/list', async (req, res) => {
     }
 
     const count = Number(players);
-    serverStats[port] = count; // メモリを更新
+    serverStats[port] = count; // メモリ上のステータスを更新
 
     try {
         const now = new Date();
         const timestamp = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
 
-        // 10秒周期を待たずに、ここで即座にDBを更新
+        // データベースを即座に更新
         await PublicStatus.findOneAndUpdate(
             { port: port },
             {
                 status: 'online',
                 playerCount: count,
-                playerNames: names || [], // ★ 名前リストをDBに保存
+                playerNames: names || [], // ★ 名前リストを保存
                 lastUpdate: timestamp
             },
             { upsert: true }
         );
-    } catch (err) {
+    } catch (err: any) {
+        // 🚨 データベースエラーをDiscordのログチャンネルへ通知
+        const logChannel = client.channels.cache.get(config.logChannelId) as TextChannel;
+        if (logChannel) {
+            logChannel.send({
+                embeds: [{
+                    title: "⚠️ データベース更新エラー",
+                    description: `**Port ${port}** のデータ保存に失敗しました。\n\`\`\`\n${err.message}\n\`\`\``,
+                    color: 0xff0000,
+                    timestamp: new Date().toISOString()
+                }]
+            }).catch(() => {});
+        }
         console.error(`❌ DB Direct Update Error [Port ${port}]:`, err);
     }
 
-    // 元のロジックを維持：イベントを通知して200を返す
+    // 既存のイベント通知ロジック
     idEvent.emit(id, { players });
     res.sendStatus(200);
 });
