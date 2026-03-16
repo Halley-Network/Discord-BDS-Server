@@ -1261,12 +1261,14 @@ app.post('/:port/eval', (req, res) => {
 app.post('/:port/list', async (req, res) => {
     const port = req.params.port;
     const { players, names, id } = req.body;
+
     if (players === undefined) return res.sendStatus(400);
 
+    // メモリ上のステータスは常に更新
     const count = Number(players);
     serverStats[port] = count; 
 
-    // ★ 修正：MongoDB が接続中(readyState === 1)の時だけ実行する
+    // ★ データベースが接続済み(readyState === 1)の時だけ書き込む
     if (mongoose.connection.readyState === 1) {
         try {
             const now = new Date();
@@ -1283,12 +1285,11 @@ app.post('/:port/list', async (req, res) => {
                 { upsert: true }
             );
         } catch (err: any) {
-            // エラー通知処理（以前作成したもの）
             console.error(`❌ DB Update Error [Port ${port}]:`, err.message);
         }
     } else {
-        // 接続されていない場合はログにだけ出す（Discordへのスパム防止）
-        console.warn(`⚠️ DB Offline: Port ${port} のデータはメモリのみ更新されました。`);
+        // 接続されていない場合はエラーログを出さず、静かに待機
+        console.log(`ℹ️ DB Offline (Port ${port}): メモリのみ更新しました。`);
     }
 
     idEvent.emit(id, { players });
@@ -1401,6 +1402,19 @@ app.get('/:port/user-list/:targetPort', async (req, res) => {
         });
     } catch (err) { res.status(500).send(err); }
 });
+
+// 30秒ごとにDBの接続状態を確認し、切れていれば再接続を試みる
+setInterval(async () => {
+    if (mongoose.connection.readyState === 0) { // 0 = disconnected
+        console.log("🔄 データベースへの再接続を試みています...");
+        try {
+            await mongoose.connect(config.mongoUri);
+            console.log("✅ データベース再接続成功");
+        } catch (err: any) {
+            console.error("❌ 再接続失敗:", err.message);
+        }
+    }
+}, 30000);
 
 app.listen(9000, () => {
     console.log("Manager API is running on port 9000");
