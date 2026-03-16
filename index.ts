@@ -1260,48 +1260,37 @@ app.post('/:port/eval', (req, res) => {
 // --- APIエンドポイント (/:port/list) のデバッグ強化版 ---
 app.post('/:port/list', async (req, res) => {
     const port = req.params.port;
-    // req.body から players, names, id を受け取る
     const { players, names, id } = req.body;
-
-    if (players === undefined) {
-        return res.sendStatus(400);
-    }
+    if (players === undefined) return res.sendStatus(400);
 
     const count = Number(players);
-    serverStats[port] = count; // メモリ上のステータスを更新
+    serverStats[port] = count; 
 
-    try {
-        const now = new Date();
-        const timestamp = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+    // ★ 修正：MongoDB が接続中(readyState === 1)の時だけ実行する
+    if (mongoose.connection.readyState === 1) {
+        try {
+            const now = new Date();
+            const timestamp = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
 
-        // データベースを即座に更新
-        await PublicStatus.findOneAndUpdate(
-            { port: port },
-            {
-                status: 'online',
-                playerCount: count,
-                playerNames: names || [], // ★ 名前リストを保存
-                lastUpdate: timestamp
-            },
-            { upsert: true }
-        );
-    } catch (err: any) {
-        // 🚨 データベースエラーをDiscordのログチャンネルへ通知
-        const logChannel = client.channels.cache.get(config.logChannelId) as TextChannel;
-        if (logChannel) {
-            logChannel.send({
-                embeds: [{
-                    title: "⚠️ データベース更新エラー",
-                    description: `**Port ${port}** のデータ保存に失敗しました。\n\`\`\`\n${err.message}\n\`\`\``,
-                    color: 0xff0000,
-                    timestamp: new Date().toISOString()
-                }]
-            }).catch(() => {});
+            await PublicStatus.findOneAndUpdate(
+                { port: port },
+                {
+                    status: 'online',
+                    playerCount: count,
+                    playerNames: names || [],
+                    lastUpdate: timestamp
+                },
+                { upsert: true }
+            );
+        } catch (err: any) {
+            // エラー通知処理（以前作成したもの）
+            console.error(`❌ DB Update Error [Port ${port}]:`, err.message);
         }
-        console.error(`❌ DB Direct Update Error [Port ${port}]:`, err);
+    } else {
+        // 接続されていない場合はログにだけ出す（Discordへのスパム防止）
+        console.warn(`⚠️ DB Offline: Port ${port} のデータはメモリのみ更新されました。`);
     }
 
-    // 既存のイベント通知ロジック
     idEvent.emit(id, { players });
     res.sendStatus(200);
 });
