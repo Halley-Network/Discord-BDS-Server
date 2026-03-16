@@ -636,6 +636,34 @@ async function startServer(port: string) {
     });
 }
 
+
+/**
+ * エラー内容を Discord のログチャンネルへ送信する共通関数
+ * @param port 発生したポート番号
+ * @param error エラーオブジェクトまたはメッセージ
+ */
+function sendErrorToLogChannel(port: string, error: any) {
+    const logChannelId = config.logChannelId; // config から ID を取得
+    const logChannel = client.channels.cache.get(logChannelId) as TextChannel;
+
+    if (logChannel) {
+        logChannel.send({
+            embeds: [{
+                title: "⚠️ システムエラー通知",
+                description: `**Port ${port}** で問題が発生しました。`,
+                fields: [
+                    { name: "エラー内容", value: `\`\`\`\n${error.message || error}\n\`\`\`` }
+                ],
+                color: 0xff0000, // 赤色
+                timestamp: new Date().toISOString()
+            }]
+        }).catch(err => console.error("Discord へのログ送信に失敗しました:", err));
+    }
+    
+    // コンソールにも出力しておく
+    console.error(`[Port ${port}] Error:`, error);
+}
+
 client.once(Events.ClientReady, async (readyClient) => {
     discoverServers();
     checkOrphanedProcesses();
@@ -1264,11 +1292,11 @@ app.post('/:port/list', async (req, res) => {
 
     if (players === undefined) return res.sendStatus(400);
 
-    // メモリ上のステータスは常に更新
+    // メモリ上の値は常に更新
     const count = Number(players);
     serverStats[port] = count; 
 
-    // ★ データベースが接続済み(readyState === 1)の時だけ書き込む
+    // ★ MongoDB の接続状態を確認 (1 = connected)
     if (mongoose.connection.readyState === 1) {
         try {
             const now = new Date();
@@ -1285,11 +1313,12 @@ app.post('/:port/list', async (req, res) => {
                 { upsert: true }
             );
         } catch (err: any) {
-            console.error(`❌ DB Update Error [Port ${port}]:`, err.message);
+            // DB更新エラーをDiscordログへ（既存のロジック）
+            sendErrorToLogChannel(port, err); 
         }
     } else {
-        // 接続されていない場合はエラーログを出さず、静かに待機
-        console.log(`ℹ️ DB Offline (Port ${port}): メモリのみ更新しました。`);
+        // 接続が切れている場合は、ログにのみ表示して再接続を促す
+        console.log(`⚠️ DB Offline (Port ${port}): 接続待ちのためメモリ更新のみ行いました。readyState: ${mongoose.connection.readyState}`);
     }
 
     idEvent.emit(id, { players });
@@ -1334,6 +1363,7 @@ app.post('/:port/leave', (req, res) => {
     res.sendStatus(200);*/
 });
 
+/*
 app.post('/:port/list', async (req, res) => {
     const port = req.params.port;
     const { players, names } = req.body; // ★ names を受け取る
@@ -1351,7 +1381,7 @@ app.post('/:port/list', async (req, res) => {
         );
     } catch (err) { console.error(err); }
     res.sendStatus(200);
-});
+});*/
 
 app.get('/:port/status-of/:targetPort', async (req, res) => {
     const targetPort = req.params.targetPort;
@@ -1403,18 +1433,21 @@ app.get('/:port/user-list/:targetPort', async (req, res) => {
     } catch (err) { res.status(500).send(err); }
 });
 
-// 30秒ごとにDBの接続状態を確認し、切れていれば再接続を試みる
+// 30秒ごとに接続状態を監視し、切れていれば再接続する
 setInterval(async () => {
-    if (mongoose.connection.readyState === 0) { // 0 = disconnected
-        console.log("🔄 データベースへの再接続を試みています...");
+    // 0: disconnected, 1: connected, 2: connecting, 3: disconnecting
+    if (mongoose.connection.readyState === 0 || mongoose.connection.readyState === 3) {
+        console.log("🔄 データベース接続が切断されています。再接続を試みます...");
         try {
+            // 一度切断を確実にしてから再接続
+            await mongoose.disconnect();
             await mongoose.connect(config.mongoUri);
-            console.log("✅ データベース再接続成功");
+            console.log("✅ データベース再接続に成功しました。");
         } catch (err: any) {
             console.error("❌ 再接続失敗:", err.message);
         }
     }
-}, 30000);
+}, 30000); // 30秒間隔
 
 app.listen(9000, () => {
     console.log("Manager API is running on port 9000");
