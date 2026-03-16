@@ -243,7 +243,9 @@ async function reconnectDB(): Promise<{ success: boolean; message: string }> {
 
         // 2. 接続を新規に確立する
         await mongoose.connect(config.mongoUri, {
-            serverSelectionTimeoutMS: 5000, // 5秒でタイムアウトさせる
+            family: 4,
+            serverSelectionTimeoutMS: 10000,
+            tlsAllowInvalidCertificates: true,
         });
 
         const successMsg = "✅ データベースへの再接続に成功しました。";
