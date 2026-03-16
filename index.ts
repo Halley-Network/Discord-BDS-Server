@@ -229,6 +229,38 @@ async function connectDB(): Promise<{ success: boolean; message: string }> {
     }
 }
 
+/**
+ * データベースを強制リセット（切断 -> 再接続）する関数
+ */
+async function reconnectDB(): Promise<{ success: boolean; message: string }> {
+    try {
+        // 1. 接続状態を確認し、未切断なら強制切断する
+        // readyState: 0=切断, 1=接続中, 2=接続試行中, 3=切断中
+        if (mongoose.connection.readyState !== 0) {
+            console.log("🔄 既存の接続を破棄しています...");
+            await mongoose.disconnect();
+        }
+
+        // 2. 接続を新規に確立する
+        await mongoose.connect(config.mongoUri, {
+            serverSelectionTimeoutMS: 5000, // 5秒でタイムアウトさせる
+        });
+
+        const successMsg = "✅ データベースへの再接続に成功しました。";
+        console.log(successMsg);
+        return { success: true, message: successMsg };
+
+    } catch (err: any) {
+        const errorMsg = `❌ データベース再接続失敗: ${err.message}`;
+        console.error(errorMsg);
+        
+        // ログチャンネルへ通報
+        sendErrorToLogChannel("System", err); 
+        
+        return { success: false, message: errorMsg };
+    }
+}
+
 async function updatePublicStatus() {
     const now = new Date();
     const timestamp = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
@@ -992,14 +1024,17 @@ client.on('interactionCreate', async (interaction) => {
         if (subcommand === "reconnect-db") {
             await interaction.deferReply();
             
-            const result = await connectDB();
+            // 強制リセットを実行
+            const result = await reconnectDB();
             
-            if (result.success) {
-                await interaction.editReply({ content: `✅ **Success:** ${result.message}` });
-            } else {
-                await interaction.editReply({ content: `❌ **Failed:** ${result.message}\nログチャンネルに詳細を出力しました。` });
-            }
-            return;
+            await interaction.editReply({
+                embeds: [{
+                    title: "🔌 Database Reconnection",
+                    description: result.message,
+                    color: result.success ? 0x00ff00 : 0xff0000,
+                    timestamp: new Date().toISOString()
+                }]
+            });
         }
     }
 
@@ -1433,21 +1468,13 @@ app.get('/:port/user-list/:targetPort', async (req, res) => {
     } catch (err) { res.status(500).send(err); }
 });
 
-// 30秒ごとに接続状態を監視し、切れていれば再接続する
+// 1分ごとに接続をチェックし、死んでいれば「外科手術」を行う
 setInterval(async () => {
-    // 0: disconnected, 1: connected, 2: connecting, 3: disconnecting
-    if (mongoose.connection.readyState === 0 || mongoose.connection.readyState === 3) {
-        console.log("🔄 データベース接続が切断されています。再接続を試みます...");
-        try {
-            // 一度切断を確実にしてから再接続
-            await mongoose.disconnect();
-            await mongoose.connect(config.mongoUri);
-            console.log("✅ データベース再接続に成功しました。");
-        } catch (err: any) {
-            console.error("❌ 再接続失敗:", err.message);
-        }
+    if (mongoose.connection.readyState === 0) {
+        console.warn("⚠️ データベースが切断されています。自動復旧を開始します...");
+        await reconnectDB(); // 強制リセット
     }
-}, 30000); // 30秒間隔
+}, 60000);
 
 app.listen(9000, () => {
     console.log("Manager API is running on port 9000");
