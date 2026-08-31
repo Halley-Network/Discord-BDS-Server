@@ -5,7 +5,8 @@ import {
     IntentsBitField,
     TextChannel,
     Events,
-    ChatInputApplicationCommandData
+    ChatInputApplicationCommandData,
+    EmbedBuilder
 } from 'discord.js';
 import { default as express } from 'express';
 import { default as bodyParser } from "body-parser";
@@ -16,6 +17,8 @@ import EventEmitter from 'events';
 import cors from 'cors';
 import { promisify } from 'util';
 import mongoose from 'mongoose';
+import https from 'https';
+import type { ChildProcess } from 'child_process';
 
 // 物理ファイルを読み込み、変数に格納
 let config = JSON.parse(fs.readFileSync(path.resolve(__dirname, './config.json'), 'utf-8'));
@@ -158,37 +161,74 @@ const DiscordCommandData: ChatInputApplicationCommandData = {
                     description: "データベースへの再接続を手動で実行します"
                 }
             ]
+        },
+        // グループ3: MCXboxBroadcast 操作
+        {
+            type: ApplicationCommandOptionType.SubcommandGroup,
+            name: "mcxb",
+            description: "MCXboxBroadcast (Broadcaster) の制御・管理",
+            options: [
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "start",
+                    description: "MCXboxBroadcastを起動します"
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "stop",
+                    description: "MCXboxBroadcastを停止します"
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "restart",
+                    description: "MCXboxBroadcastを再起動します"
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "update",
+                    description: "GitHub Releases から最新版を取得してアップデートします"
+                },
+                {
+                    type: ApplicationCommandOptionType.Subcommand,
+                    name: "status",
+                    description: "MCXboxBroadcast の稼働状態を確認します"
+                }
+            ]
         }
     ]
-}
+};
 
 // --- 外部公開用スキーマ ---
 const publicStatusSchema = new mongoose.Schema({
     port: { type: String, required: true, unique: true },
     status: { type: String, enum: ['online', 'offline'], required: true },
-    playerCount: { type: Number, default: 0 }, // 現在の人数のみ保持
+    playerCount: { type: Number, default: 0 },
     playerNames: { type: [String], default: [] },
     lastUpdate: { type: String, required: true }
 });
 const PublicStatus = mongoose.model('PublicStatus', publicStatusSchema, 'RealTimeStatus');
+
+// --- ログ保存用スキーマ ---
+const serverLogSchema = new mongoose.Schema({
+    source: { type: String, required: true },
+    line: { type: String, required: true },
+    timestamp: { type: Date, default: Date.now, expires: '7d' }
+});
+const ServerLog = mongoose.model('ServerLog', serverLogSchema, 'ServerLogs');
 
 // 現在の人数だけを保持するメモリ変数
 const serverStats: { [port: string]: number } = {};
 
 // Mongoose 接続とループ開始
 async function connectPublicDB() {
-        try {
-        // serverSelectionTimeoutMS を入れておくと、失敗時にすぐわかります
-        
+    try {
         await mongoose.connect(config.mongoUri, {
             family: 4,
             serverSelectionTimeoutMS: 10000,
             tlsAllowInvalidCertificates: true,
         });
-        //await mongoose.connect(config.mongoUri, mongoose_client);
         console.log("🍃 Public Database connected to 'ServerStatus' via Mongoose");
         
-        // 初回起動時にも一度同期を実行
         updatePublicStatus();
         setInterval(updatePublicStatus, 10000);
     } catch (err) {
@@ -201,7 +241,6 @@ async function connectPublicDB() {
  */
 async function connectDB(): Promise<{ success: boolean; message: string }> {
     try {
-        // 既存の接続があれば一度切app.post('/:port/list'断する
         if (mongoose.connection.readyState !== 0) {
             await mongoose.disconnect();
         }
@@ -213,7 +252,6 @@ async function connectDB(): Promise<{ success: boolean; message: string }> {
         const errorMsg = `❌ DB 接続失敗: ${err.message}`;
         console.error(errorMsg);
         
-        // ログチャンネルにエラーを送信
         const logChannel = client.channels.cache.get(config.logChannelId) as TextChannel;
         if (logChannel) {
             logChannel.send({
@@ -234,14 +272,11 @@ async function connectDB(): Promise<{ success: boolean; message: string }> {
  */
 async function reconnectDB(): Promise<{ success: boolean; message: string }> {
     try {
-        // 1. 接続状態を確認し、未切断なら強制切断する
-        // readyState: 0=切断, 1=接続中, 2=接続試行中, 3=切断中
         if (mongoose.connection.readyState !== 0) {
             console.log("🔄 既存の接続を破棄しています...");
             await mongoose.disconnect();
         }
 
-        // 2. 接続を新規に確立する
         await mongoose.connect(config.mongoUri, {
             family: 4,
             serverSelectionTimeoutMS: 10000,
@@ -255,10 +290,7 @@ async function reconnectDB(): Promise<{ success: boolean; message: string }> {
     } catch (err: any) {
         const errorMsg = `❌ データベース再接続失敗: ${err.message}`;
         console.error(errorMsg);
-        
-        // ログチャンネルへ通報
         sendErrorToLogChannel("System", err); 
-        
         return { success: false, message: errorMsg };
     }
 }
@@ -270,7 +302,6 @@ async function updatePublicStatus() {
     for (const port in detectedServers) {
         const isActive = activeProcesses[port] !== undefined;
         
-        // サーバーが停止している場合のみ、人数を 0 にリセットして更新
         if (!isActive) {
             try {
                 await PublicStatus.findOneAndUpdate(
@@ -282,21 +313,200 @@ async function updatePublicStatus() {
                     },
                     { upsert: true }
                 );
-                serverStats[port] = 0; // メモリもリセット
+                serverStats[port] = 0;
             } catch (err) {
                 console.error(`❌ DB Sync Error (Offline) [Port ${port}]:`, err);
             }
         }
-        // 起動中の場合は API (/:port/list) 側が更新を行うため、ここでは何もしない（上書き防止）
     }
 }
 
 const activeProcesses: { [port: string]: ChildProcessWithoutNullStreams } = {};
-const detectedServers: { [port: string]: { path: string, cwd: string, channelId: string } } = {};
 const messageQueues: { [port: string]: any[] } = {};
 const idEvent = new EventEmitter();
 
-// --- 状態保存ロジック ---
+// 1. 変数定義と一斉送信関数の追加
+const detectedServers: { [port: string]: { path: string, cwd: string, channelIds: string[] } } = {};
+
+function broadcastToLinkedChannels(port: string, messagePayload: any) {
+    const server = detectedServers[port];
+    if (!server || !server.channelIds) return;
+
+    for (const cid of server.channelIds) {
+        const channel = client.channels.cache.get(cid) as TextChannel;
+        if (channel) {
+            channel.send(messagePayload).catch(() => {});
+        }
+    }
+}
+
+// リアルタイムログ中継用のエミッター
+const logEmitter = new EventEmitter();
+
+// MCXboxBroadcast プロセスとスレッドID保持変数
+let mcxbProcess: ChildProcess | null = null;
+let mcxbThreadId: string | null = null;
+
+async function startMCXB(): Promise<{ success: boolean; message: string }> {
+    const jarName = config.mcxn?.jarName || "MCXboxBroadcastStandalone.jar";
+    const mcxbCwd = config.mcxn?.cwd || process.cwd();
+
+    if (mcxbProcess && !mcxbProcess.killed) {
+        return { success: false, message: "⚠️ MCXboxBroadcast は既に起動しています。" };
+    }
+
+    const logChannelId = config.logChannelId;
+    const logChannel = client.channels.cache.get(logChannelId) as TextChannel;
+    
+    if (!logChannel) {
+        return { success: false, message: "❌ ログチャンネルが見つからないため起動を中止しました。" };
+    }
+
+    try {
+        const now = new Date();
+        const startTimeStr = `${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}${now.getDate().toString().padStart(2, '0')}_${now.getHours().toString().padStart(2, '0')}${now.getMinutes().toString().padStart(2, '0')}${now.getSeconds().toString().padStart(2, '0')}`;
+        const threadName = `MCXB_${startTimeStr}`;
+
+        const thread = await logChannel.threads.create({
+            name: threadName,
+            autoArchiveDuration: 1440,
+            reason: `MCXboxBroadcast ログ用`
+        });
+
+        mcxbThreadId = thread.id;
+
+        mcxbProcess = spawn('java', ['-jar', jarName], {
+            cwd: mcxbCwd,
+            detached: false
+        });
+
+        let lineBuffer = "";
+
+        mcxbProcess.stdout?.on('data', async (data) => {
+            lineBuffer += data.toString();
+            const lines = lineBuffer.split(/\r?\n/);
+            lineBuffer = lines.pop() || "";
+
+            for (const line of lines) {
+                const cleanLine = line.trim();
+                if (!cleanLine) continue;
+                
+                logEmitter.emit('log', { source: "MCXB", line: cleanLine });
+
+                try {
+                    if (mcxbThreadId) {
+                        const logThread = await client.channels.fetch(mcxbThreadId) as any;
+                        if (logThread) {
+                            await logThread.send(`\`${new Date().toLocaleTimeString()}\` \`\`\`\n${cleanLine}\n\`\`\``);
+                        }
+                    }
+                } catch (e) {
+                    logChannel.send(`[MCXB] ${cleanLine}`).catch(() => {});
+                }
+            }
+        });
+
+        mcxbProcess.stderr?.on('data', async (data) => {
+            const line = data.toString().trim();
+            if (!line) return;
+
+            logEmitter.emit('log', { source: "MCXB_ERR", line: line });
+
+            try {
+                if (mcxbThreadId) {
+                    const logThread = await client.channels.fetch(mcxbThreadId) as any;
+                    if (logThread) await logThread.send(`\`${new Date().toLocaleTimeString()}\` **[ERR]** \`\`\`\n${line}\n\`\`\``);
+                }
+            } catch (e) {}
+        });
+
+        mcxbProcess.on('close', (code) => {
+            console.log(`[MCXB] Javaプロセスが終了しました (Code: ${code})`);
+            mcxbProcess = null;
+            
+            if (mcxbThreadId) {
+                client.channels.fetch(mcxbThreadId).then((t: any) => {
+                    if (t) {
+                        t.send(`🛑 MCXboxBroadcast が停止しました。 (Code: ${code})`)
+                            .then(() => t.setArchived(true).catch(() => {}))
+                            .catch(() => {});
+                    }
+                }).catch(() => {});
+                mcxbThreadId = null;
+            }
+        });
+
+        return { success: true, message: `🚀 MCXboxBroadcast を起動し、専用スレッドを作成しました。` };
+    } catch (err: any) {
+        return { success: false, message: `❌ 起動失敗: ${err.message}` };
+    }
+}
+
+async function stopMCXB(): Promise<{ success: boolean; message: string }> {
+    const jarName = config.mcxn?.jarName || "MCXboxBroadcastStandalone.jar";
+
+    try {
+        if (process.platform === 'win32') {
+            await execAsync(`wmic process where "CommandLine like '%${jarName}%'" call terminate`).catch(() => {});
+        }
+        
+        if (mcxbProcess) {
+            mcxbProcess.kill();
+            mcxbProcess = null;
+        }
+
+        return { success: true, message: "🛑 MCXboxBroadcast を停止しました。" };
+    } catch (err: any) {
+        return { success: false, message: `❌ 停止失敗: ${err.message}` };
+    }
+}
+
+function downloadLatestRelease(downloadUrl: string, destPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const request = (url: string) => {
+            https.get(url, { headers: { 'User-Agent': 'Node.js-Bot' } }, (response) => {
+                if (response.statusCode === 301 || response.statusCode === 302) {
+                    return request(response.headers.location!);
+                }
+                
+                if (response.statusCode !== 200) {
+                    return reject(new Error(`Download failed with status code ${response.statusCode}`));
+                }
+
+                const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+                
+                const file = fs.createWriteStream(destPath);
+                response.pipe(file);
+                
+                file.on('finish', () => {
+                    file.close(() => {
+                        const stats = fs.statSync(destPath);
+                        
+                        if (contentLength > 0 && stats.size !== contentLength) {
+                            fs.unlink(destPath, () => {}); 
+                            reject(new Error(`ダウンロードが途中で切断されました (取得: ${stats.size} byte / 期待値: ${contentLength} byte)`));
+                        } else if (stats.size < 1024) {
+                            reject(new Error(`ファイルが破損しているか空です (サイズ: ${stats.size} バイト)`));
+                        } else {
+                            resolve(); 
+                        }
+                    });
+                });
+                
+                file.on('error', (err) => {
+                    fs.unlink(destPath, () => {});
+                    reject(err);
+                });
+            }).on('error', (err) => {
+                if (fs.existsSync(destPath)) fs.unlink(destPath, () => {});
+                reject(err);
+            });
+        };
+        
+        request(downloadUrl);
+    });
+}
+
 function saveState() {
     const state: { [port: string]: number } = {};
     for (const port in activeProcesses) {
@@ -322,26 +532,20 @@ function checkOrphanedProcesses() {
     }
 }
 
-// 特定のポートのサーバーを再起動
 async function restartServer(port: string) {
     if (activeProcesses[port]) {
         return new Promise<void>((resolve) => {
-            // プロセスが閉じたら再起動を実行する
             activeProcesses[port].once('close', async () => {
                 await startServer(port);
                 resolve();
             });
-            // サーバーに停止命令を送信
             sendToConsole(port, "stop");
         });
     } else {
-        // 動いていない場合はそのまま起動
         await startServer(port);
     }
 }
 
-
-// --- ユーティリティ ---
 function getQueue(port: string) {
     if (!messageQueues[port]) messageQueues[port] = [];
     return messageQueues[port];
@@ -356,6 +560,7 @@ function sendToConsole(port: string, command: string): boolean {
     return false;
 }
 
+// 2. サーバー検出処理の修正
 function discoverServers() {
     console.log("🔍 サーバーフォルダを検索中...");
     const currentDir = path.join(process.cwd(), "..");
@@ -371,12 +576,19 @@ function discoverServers() {
 
             if (finalPath) {
                 const mapping = (config.servers as any)[port];
+                
+                let cIds: string[] = [];
+                if (mapping) {
+                    if (Array.isArray(mapping.channelIds)) cIds = mapping.channelIds;
+                    else if (typeof mapping.channelId === "string") cIds = [mapping.channelId];
+                }
+
                 detectedServers[port] = {
                     path: finalPath,
                     cwd: folderPath,
-                    channelId: mapping?.channelId || config.logChannelId
+                    channelIds: cIds.length > 0 ? cIds : [config.logChannelId]
                 };
-                console.log(`✅ 発見: Port ${port} -> ${finalPath}`);
+                console.log(`✅ 発見: Port ${port} -> ${finalPath} (同期先: ${cIds.length}チャンネル)`);
             }
         }
     }
@@ -385,11 +597,8 @@ function discoverServers() {
 function generateStatusEmbed() {
     const list = Object.keys(detectedServers).map(p => {
         const active = activeProcesses[p] !== undefined;
-        const threadId = activeThreads[p]; // 起動中のスレッドIDを取得
-        
-        // 起動中の場合のみ、スレッドへのリンクを表示
-        const threadLink = (active && threadId) ? `\n　└ ログ: <#${threadId}>` : "";
-        
+        const threadId = activeThreads[p];
+        const threadLink = (active && threadId) ? `\n └ ログ: <#${threadId}>` : "";
         return `**Port ${p}**: ${active ? "🟢 起動中" : "🔴 停止中"}${threadLink}`;
     });
 
@@ -401,7 +610,6 @@ function generateStatusEmbed() {
     };
 }
 
-// --- Git Pull & コンパイルを実行する内部関数 ---
 async function runGitPull(port: string): Promise<string> {
     const server = detectedServers[port];
     if (!server) return `Port ${port}: サーバーが見つかりません。`;
@@ -418,11 +626,9 @@ async function runGitPull(port: string): Promise<string> {
         }
 
         try {
-            // 1. Git Pull を実行
             const { stdout: pullOut } = await execAsync('git pull', { cwd: targetPath });
             results += `✅ ${folder}: Pull \`${pullOut.trim() || "Already up to date."}\`\n`;
 
-            // 2. config.ts の探索と書き換え
             const potentialPaths = [
                 path.join(targetPath, "config.ts"),
                 path.join(targetPath, "src", "config.ts"),
@@ -447,22 +653,13 @@ async function runGitPull(port: string): Promise<string> {
             }
             if (!fileFound) results += `   ⚠️ config.ts 未検出 (スキップ)\n`;
 
-            // 3. コンパイル処理の追加 ($ tsc -d)
             results += `   ⏳ コンパイル中 (\`tsc -d\`)...`;
             try {
-                // 1. 依存関係のインストール（型定義ファイルを揃える）
-                // 初回やリポジトリ更新時に必要です
                 await execAsync('npm install', { cwd: targetPath });
-
-                // 2. コンパイルの実行
                 await execAsync('tsc -d', { cwd: targetPath });
                 results += ` ✅ 成功\n`;
             } catch (e: any) {
-                // エラー詳細を取得
                 const detail = e.stdout || e.message;
-                
-                // JSファイルが生成されていれば「成功」とみなす
-                // (scripts/index.js など、ビルド後のパスに合わせて調整してください)
                 const jsPath = path.join(targetPath, "scripts", "index.js"); 
                 if (fs.existsSync(jsPath)) {
                     results += ` ✅ 成功 (型エラー ${e.code} は無視されました)\n`;
@@ -479,9 +676,7 @@ async function runGitPull(port: string): Promise<string> {
 }
 
 async function sendSplitMessage(interaction: any, title: string, text: string) {
-    // Discordの制限2000文字に対し、装飾分を含めて1900文字で分割
     const chunks = text.match(/[\s\S]{1,1900}/g) || [];
-    
     for (let i = 0; i < chunks.length; i++) {
         const isFirst = i === 0;
         const header = isFirst ? `**${title}**\n` : "";
@@ -495,7 +690,6 @@ async function sendSplitMessage(interaction: any, title: string, text: string) {
     }
 }
 
-// バックアップを実行し、前回との差分も計算する
 async function runBackup(port: string, serverCwd: string) {
     const managerDir = path.resolve(__dirname);
     const backupBaseDir = path.join(managerDir, "..", "_backups");
@@ -504,20 +698,17 @@ async function runBackup(port: string, serverCwd: string) {
 
     if (!fs.existsSync(portBackupDir)) fs.mkdirSync(portBackupDir, { recursive: true });
 
-    // --- 差分計算のための準備 ---
-    // 既存のバックアップファイルを取得して日付順にソート
     const existingFiles = fs.readdirSync(portBackupDir)
         .filter(f => f.endsWith('.zip'))
         .map(f => ({ name: f, time: fs.statSync(path.join(portBackupDir, f)).mtime.getTime() }))
         .sort((a, b) => b.time - a.time);
 
-    const prevBackup = existingFiles[0]; // 最新のファイルが「前回のバックアップ」
+    const prevBackup = existingFiles[0];
     let prevSize = 0;
     if (prevBackup) {
         prevSize = fs.statSync(path.join(portBackupDir, prevBackup.name)).size;
     }
 
-    // --- 圧縮処理 (前回の Robocopy 方式) ---
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const fileName = `world_backup_${timestamp}.zip`;
     const destPath = path.join(portBackupDir, fileName);
@@ -526,18 +717,15 @@ async function runBackup(port: string, serverCwd: string) {
     try {
         if (fs.existsSync(tempStageDir)) fs.rmSync(tempStageDir, { recursive: true, force: true });
         
-        // Robocopy で一時コピー
         const copyCommand = `robocopy "${worldPath}" "${tempStageDir}" /S /E /COPY:DAT /R:0 /W:0 /NP /NFL /NDL`;
         try { await execAsync(copyCommand); } catch (e: any) { if (e.code > 7) throw e; }
 
-        // 圧縮
         const zipCommand = `powershell -Command "Compress-Archive -Path '${tempStageDir}\\*' -DestinationPath '${destPath}' -Force"`;
         await execAsync(zipCommand);
     } finally {
         if (fs.existsSync(tempStageDir)) fs.rmSync(tempStageDir, { recursive: true, force: true });
     }
 
-    // --- 結果の集計 ---
     const newSize = fs.statSync(destPath).size;
     const delta = newSize - prevSize;
     const formatSize = (bytes: number) => (bytes / (1024 * 1024)).toFixed(2) + " MB";
@@ -550,10 +738,8 @@ async function runBackup(port: string, serverCwd: string) {
     };
 }
 
-// --- スレッドIDを保持する変数を追加 ---
 const activeThreads: { [port: string]: string } = {};
 
-// --- サーバー起動処理の共通化 ---
 async function startServer(port: string) {
     const server = detectedServers[port];
     if (!server || activeProcesses[port]) return;
@@ -561,32 +747,26 @@ async function startServer(port: string) {
     const logChannel = client.channels.cache.get(config.logChannelId) as TextChannel;
     if (!logChannel) return console.error("❌ ログチャンネルが見つかりません。");
 
-    // 1. 命名規則に基づいたスレッドの作成 (ポート番号_スタート時間)
     const now = new Date();
     const startTimeStr = `${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}${now.getDate().toString().padStart(2, '0')}_${now.getHours().toString().padStart(2, '0')}${now.getMinutes().toString().padStart(2, '0')}${now.getSeconds().toString().padStart(2, '0')}`;
     const threadName = `${port}_${startTimeStr}`;
 
     const thread = await logChannel.threads.create({
         name: threadName,
-        autoArchiveDuration: 1440, // 24時間でアーカイブ
+        autoArchiveDuration: 1440,
         reason: `BDS Port ${port} ログ用`
     });
 
     activeThreads[port] = thread.id;
 
-    // 2. プロセスの起動
     const child = spawn(server.path, [], { cwd: server.cwd });
     activeProcesses[port] = child;
     saveState();
 
-    const chatChannel = client.channels.cache.get(server.channelId) as TextChannel;
-
-    // --- 起動通知 ---
-    if (chatChannel) {
-        chatChannel.send({
-            embeds: [{ title: "Server Status", description: `🚀 **Port:${port}** が起動しました。`, color: 0x00ff00 }]
-        }).catch(() => {});
-    }
+    // 3. 起動通知の修正
+    broadcastToLinkedChannels(port, {
+        embeds: [{ title: "Server Status", description: `🚀 **Port:${port}** が起動しました。`, color: 0x00ff00 }]
+    });
 
     let lineBuffer = "";
 
@@ -598,48 +778,42 @@ async function startServer(port: string) {
         for (const line of lines) {
             const cleanLine = line.trim();
             if (!cleanLine) continue;
+            
+            logEmitter.emit('log', { source: port, line: cleanLine });
 
-            // 3. ログをスレッドに送信
             try {
-                // キャッシュまたはフェッチでスレッドを取得
                 const logThread = await client.channels.fetch(activeThreads[port]) as any;
                 if (logThread) {
                     await logThread.send(`\`${new Date().toLocaleTimeString()}\` \`\`\`\n${cleanLine}\n\`\`\``);
                 }
             } catch (e) {
-                // スレッド送信失敗時はメインのログチャンネルに流す
                 logChannel.send(`[${port}] ${cleanLine}`).catch(() => {});
             }
             
-            // 2. 参加・退出の検知 (デバッグログ付き)
-            if (chatChannel) {
-                // BDSのログにはタイムスタンプ等が含まれるため、includes か test が確実です
-                // 参加検知: "Player connected: 名前, xuid: ..."
-                if (cleanLine.includes("Player connected:")) {
-                    const name = cleanLine.match(/Player connected: ([^,]+)/)?.[1];
-                    if (name) {
-                        chatChannel.send({
-                            embeds: [{
-                                title: "Join",
-                                description: `**${name}** が参加しました。`,
-                                color: 0x00ff00
-                            }]
-                        }).catch(() => {});
-                    }
+            // 3. 参加・退出ログの修正
+            if (cleanLine.includes("Player connected:")) {
+                const name = cleanLine.match(/Player connected: ([^,]+)/)?.[1];
+                if (name) {
+                    broadcastToLinkedChannels(port, {
+                        embeds: [{
+                            title: "Join",
+                            description: `**${name}** が参加しました。`,
+                            color: 0x00ff00
+                        }]
+                    });
                 }
+            }
 
-                // 退出検知: "Player disconnected: 名前, xuid: ..."
-                if (cleanLine.includes("Player disconnected:")) {
-                    const name = cleanLine.match(/Player disconnected: ([^,]+)/)?.[1];
-                    if (name) {
-                        chatChannel.send({
-                            embeds: [{
-                                title: "Leave",
-                                description: `**${name}** が退出しました。`,
-                                color: 0xff0000
-                            }]
-                        }).catch(() => {});
-                    }
+            if (cleanLine.includes("Player disconnected:")) {
+                const name = cleanLine.match(/Player disconnected: ([^,]+)/)?.[1];
+                if (name) {
+                    broadcastToLinkedChannels(port, {
+                        embeds: [{
+                            title: "Leave",
+                            description: `**${name}** が退出しました。`,
+                            color: 0xff0000
+                        }]
+                    });
                 }
             }
         }
@@ -650,15 +824,14 @@ async function startServer(port: string) {
         delete activeThreads[port];
         saveState();
         
-        if (chatChannel) {
-            chatChannel.send({
-                embeds: [{
-                    title: "Server Status",
-                    description: `🛑 **Port:${port}** が完全に停止しました。(Code: ${code})\n※再起動の場合は、この後すぐに起動通知が流れます。`,
-                    color: 0xff0000 // 赤色
-                }]
-            }).catch(() => {});
-        }
+        // 3. 停止通知の修正
+        broadcastToLinkedChannels(port, {
+            embeds: [{
+                title: "Server Status",
+                description: `🛑 **Port:${port}** が完全に停止しました。(Code: ${code})\n※再起動の場合は、この後すぐに起動通知が流れます。`,
+                color: 0xff0000
+            }]
+        });
 
         if (thread) {
             thread.send(`🛑 サーバーが停止しました。 (Code: ${code})`)
@@ -670,14 +843,8 @@ async function startServer(port: string) {
     });
 }
 
-
-/**
- * エラー内容を Discord のログチャンネルへ送信する共通関数
- * @param port 発生したポート番号
- * @param error エラーオブジェクトまたはメッセージ
- */
 function sendErrorToLogChannel(port: string, error: any) {
-    const logChannelId = config.logChannelId; // config から ID を取得
+    const logChannelId = config.logChannelId;
     const logChannel = client.channels.cache.get(logChannelId) as TextChannel;
 
     if (logChannel) {
@@ -688,33 +855,26 @@ function sendErrorToLogChannel(port: string, error: any) {
                 fields: [
                     { name: "エラー内容", value: `\`\`\`\n${error.message || error}\n\`\`\`` }
                 ],
-                color: 0xff0000, // 赤色
+                color: 0xff0000,
                 timestamp: new Date().toISOString()
             }]
         }).catch(err => console.error("Discord へのログ送信に失敗しました:", err));
     }
     
-    // コンソールにも出力しておく
     console.error(`[Port ${port}] Error:`, error);
 }
 
 client.once(Events.ClientReady, async (readyClient) => {
     discoverServers();
     checkOrphanedProcesses();
-    
-    // 公開用データベースに接続
     await connectPublicDB();
-    
     console.log(`🚀 Manager connected to Discord & Public DB`);
 });
 
-// --- Discord ボット処理 ---
 client.on('ready', async () => {
     discoverServers();
     checkOrphanedProcesses();
     console.log(`🚀 Manager logged in as ${client.user!.tag}`);
-    
-    // コマンド登録：2つのグループを作成
     await client.application!.commands.set([DiscordCommandData], config.guildId);
 });
 
@@ -722,16 +882,22 @@ client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== "admin") return;
 
+    const cmdChannelId = config.commandChannelId || config.logChannelId;
+    if (interaction.channelId !== cmdChannelId) {
+        return interaction.reply({ 
+            content: `❌ 管理コマンドは指定された管制チャンネル (<#${cmdChannelId}>) でのみ実行可能です。`, 
+            ephemeral: true 
+        });
+    }
+
     const roleId = config.commands.opCommands.roleId;
     if (!(interaction.member?.roles as GuildMemberRoleManager).cache.has(roleId)) {
         return interaction.reply({ content: "実行権限がありません。", ephemeral: true });
     }
 
-    // グループとサブコマンドを取得
     const group = interaction.options.getSubcommandGroup();
     const subcommand = interaction.options.getSubcommand();
 
-    // --- System グループの処理 ---
     if (group === "system") {
         if (subcommand === "update-bds") {
             await interaction.deferReply();
@@ -744,19 +910,17 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.editReply(`❌ アップデーターが見つかりません。`);
             }
 
-            // 1. 現在起動しているサーバーを記録
             const runningPorts = Object.keys(activeProcesses);
 
             if (runningPorts.length > 0) {
                 await interaction.editReply(`⏳ 稼働中のサーバー (${runningPorts.join(", ")}) を停止してからアップデートを開始します...`);
 
-                // 全てのサーバーが閉じるのを待機するPromise配列
                 const stopPromises = runningPorts.map(port => {
                     return new Promise<void>((resolve) => {
                         const proc = activeProcesses[port];
                         if (proc) {
                             proc.once('close', () => resolve());
-                            sendToConsole(port, "stop"); // 停止命令
+                            sendToConsole(port, "stop");
                         } else {
                             resolve();
                         }
@@ -767,7 +931,6 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.editReply(`✅ 全サーバーの停止を確認。アップデートを実行中...`);
             }
 
-            // 2. アップデート実行 (spawnによるストリーム方式)
             try {
                 const logStream = fs.createWriteStream(logFileName);
                 let fullOutput = "";
@@ -787,7 +950,6 @@ client.on('interactionCreate', async (interaction) => {
 
                     const isSuccess = fullOutput.includes("All tasks completed!");
                     
-                    // 3. 元々動いていたサーバーのみ再起動
                     if (isSuccess && code === 0) {
                         await interaction.followUp(`✅ アップデート成功。元々稼働していたサーバー (${runningPorts.join(", ") || "なし"}) を再起動します。`);
                         for (const port of runningPorts) {
@@ -819,32 +981,27 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (subcommand === "monitor") {
-            // 1. もし既に実行中のモニターがあれば停止させる（最新のみを動かすため）
             if (currentMonitorInterval) {
                 clearInterval(currentMonitorInterval);
                 currentMonitorInterval = null;
             }
 
-            // 2. 初回応答
             await interaction.reply({ 
                 embeds: [generateStatusEmbed()] 
             });
 
-            // 3. 10秒ごとの自動更新を開始
             currentMonitorInterval = setInterval(async () => {
                 try {
-                    // 最新のメッセージ（現在の interaction）のみを更新
                     await interaction.editReply({ 
                         embeds: [generateStatusEmbed()] 
                     });
                 } catch (error) {
-                    // メッセージが削除されたり、エラーが起きた場合はタイマーを破棄
                     if (currentMonitorInterval) {
                         clearInterval(currentMonitorInterval);
                         currentMonitorInterval = null;
                     }
                 }
-            }, 10000); // 10秒間隔
+            }, 10000);
             return;
         }
 
@@ -861,7 +1018,6 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.editReply({ content: finalMsg });
         }
 
-
         if (subcommand === "db-check") {
             await interaction.deferReply();
             const connState = mongoose.connection.readyState;
@@ -872,7 +1028,6 @@ client.on('interactionCreate', async (interaction) => {
                     return interaction.editReply(`❌ DB未接続 (状態: ${states[connState]})`);
                 }
 
-                // 全データを取得
                 const records = await PublicStatus.find({}).sort({ port: 1 });
 
                 if (records.length === 0) {
@@ -909,7 +1064,6 @@ client.on('interactionCreate', async (interaction) => {
 
             for (const p of runningPorts) {
                 await restartServer(p);
-                // 負荷分散のため、次の再起動まで少し待機（任意）
                 await new Promise(resolve => setTimeout(resolve, 3000));
             }
         }
@@ -918,78 +1072,64 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.deferReply({ ephemeral: true });
 
             try {
-                // --- 1. システム構成情報の取得 ---
                 const guildName = interaction.guild?.name || "不明なサーバー";
                 const logChannel = `<#${config.logChannelId}>`;
                 
-                // 各サーバーのチャンネル設定
                 const serverChannels = Object.entries(config.servers)
-                    .map(([port, data]: [string, any]) => `・Port **${port}**: <#${data.channelId}>`)
+                    .map(([port, data]: [string, any]) => {
+                        // channelIds配列対応
+                        const channels = data.channelIds ? data.channelIds.map((id: string) => `<#${id}>`).join(", ") : `<#${data.channelId}>`;
+                        return `・Port **${port}**: ${channels}`;
+                    })
                     .join("\n") || "未設定";
 
-                // Gitリポジトリ名
                 const gitRepos = config.system.gitpull_target
                     .map((repo: string) => `\`${repo}\``)
                     .join(", ") || "なし";
 
-                // --- 2. コマンド一覧の生成 (スクリーンショット形式) ---
                 const commands = await interaction.guild?.commands.fetch();
-                let commandManual = "利用可能なコマンド一覧です：\n\n";
+                const adminCommand = commands?.find(cmd => cmd.name === "admin");
 
-                if (commands && commands.size > 0) {
-                    commands.forEach(cmd => {
-                        commandManual += `**/${cmd.name}** - ${cmd.description}\n`;
-
-                        if (cmd.options) {
-                            cmd.options.forEach(opt => {
-                                // SubcommandGroup (server, system など)
-                                if (opt.type === ApplicationCommandOptionType.SubcommandGroup) {
-                                    commandManual += `└ **${opt.name}** (Group)\n`;
-                                    opt.options?.forEach(sub => {
-                                        commandManual += `　└ \`/${cmd.name} ${opt.name} ${sub.name}\` - ${sub.description}\n`;
-                                    });
-                                } 
-                                // Top-level Subcommand
-                                else if (opt.type === ApplicationCommandOptionType.Subcommand) {
-                                    commandManual += `└ \`/${cmd.name} ${opt.name}\` - ${opt.description}\n`;
-                                }
-                            });
-                        }
-                        commandManual += "\n";
-                    });
+                if (!adminCommand || !adminCommand.options) {
+                    return interaction.editReply("❌ コマンド情報の取得に失敗しました。");
                 }
 
-                // --- 3. 埋め込みメッセージの構築 ---
-                await interaction.editReply({
-                    embeds: [{
-                        title: "📖 コマンドマニュアル (自動生成)",
-                        color: 0x00AAAA, // 制御工学の図面のような落ち着いた青色
-                        fields: [
-                            {
-                                name: "🌐 サーバー情報",
-                                value: `**サーバー名**: ${guildName}\n**ID**: \`${config.guildId}\``,
-                                inline: true
-                            },
-                            {
-                                name: "📜 ログ・リポジトリ",
-                                value: `**ログ**: ${logChannel}\n**Git**: ${gitRepos}`,
-                                inline: true
-                            },
-                            {
-                                name: "🎮 サーバー別チャンネル",
-                                value: serverChannels,
-                                inline: false
-                            },
-                            {
-                                name: "🛠️ 利用可能なコマンド",
-                                value: commandManual,
-                                inline: false
-                            }
-                        ],
-                        footer: { text: "※新しいコマンドは reload 後に反映されます" },
-                        timestamp: new Date().toISOString()
-                    }]
+                const embeds: any[] = [{
+                    title: "🌐 システム構成情報",
+                    color: 0x2B2D31,
+                    fields: [
+                        { name: "サーバー名", value: `${guildName} (\`${config.guildId}\`)`, inline: true },
+                        { name: "ログ・Git", value: `ログ: ${logChannel}\nリポジトリ: ${gitRepos}`, inline: true },
+                        { name: "🎮 サーバー別チャンネル", value: serverChannels, inline: false }
+                    ]
+                }];
+
+                adminCommand.options.forEach(opt => {
+                    if (opt.type === ApplicationCommandOptionType.SubcommandGroup) {
+                        let groupText = "";
+                        opt.options?.forEach(sub => {
+                            groupText += `└ \`/admin ${opt.name} ${sub.name}\` - ${sub.description}\n`;
+                        });
+
+                        let embedColor = 0x5865F2;
+                        if (opt.name === "server") embedColor = 0x57F287;
+                        if (opt.name === "system") embedColor = 0xED4245;
+                        if (opt.name === "mcxb") embedColor = 0xFEE75C;
+
+                        embeds.push({
+                            title: `🛠️ ${opt.name.toUpperCase()} コマンド`,
+                            description: groupText || "コマンドがありません",
+                            color: embedColor
+                        });
+                    }
                 });
+
+                if (embeds.length > 0) {
+                    embeds[embeds.length - 1].footer = { text: "※新しいコマンドは reload 後に反映されます" };
+                    embeds[embeds.length - 1].timestamp = new Date().toISOString();
+                }
+
+                await interaction.editReply({ embeds: embeds });
 
             } catch (err: any) {
                 console.error("Help Command Error:", err);
@@ -997,7 +1137,6 @@ client.on('interactionCreate', async (interaction) => {
             }
             return;
         }
-
 
         if (subcommand === "reload") {
             await interaction.deferReply({ ephemeral: true });
@@ -1010,7 +1149,6 @@ client.on('interactionCreate', async (interaction) => {
 
                 discoverServers();
 
-                // --- 修正後：変数 DiscordCommandData を配列として再利用する ---
                 await client.application!.commands.set([DiscordCommandData], config.guildId);
 
                 await interaction.editReply(`✅ **リロード成功**\n- サーバー数: ${Object.keys(detectedServers).length}\n- 設定とコマンドを同期しました。`);
@@ -1026,7 +1164,6 @@ client.on('interactionCreate', async (interaction) => {
         if (subcommand === "reconnect-db") {
             await interaction.deferReply();
             
-            // 強制リセットを実行
             const result = await reconnectDB();
             
             await interaction.editReply({
@@ -1040,7 +1177,6 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 
-    // --- Server グループの処理 ---
     if (group === "server") {
         const port = interaction.options.getString("port", true);
         const server = detectedServers[port];
@@ -1058,19 +1194,14 @@ client.on('interactionCreate', async (interaction) => {
         if (subcommand === "stop") {
             if (!activeProcesses[port]) return interaction.reply("サーバーが起動していません。");
 
-            const server = detectedServers[port];
-            const chatChannel = client.channels.cache.get(server.channelId) as TextChannel;
-
-            // 1. チャットチャンネルへ停止メッセージを送信
-            if (chatChannel) {
-                chatChannel.send({
-                    embeds: [{
-                        title: "Server Status",
-                        description: `🛑 **Port:${port}** の停止処理を開始しました。`,
-                        color: 0xffa500 // オレンジ
-                    }]
-                }).catch(() => {});
-            }
+            // 4. 管理コマンドの修正
+            broadcastToLinkedChannels(port, {
+                embeds: [{
+                    title: "Server Status",
+                    description: `🛑 **Port:${port}** の停止処理を開始しました。`,
+                    color: 0xffa500
+                }]
+            });
 
             sendToConsole(port, "say §e[Discord] An administrator has issued a command to stop the server.");
             sendToConsole(port, "say §e[Discord] The server will shut down in 5 seconds.");            
@@ -1102,57 +1233,41 @@ client.on('interactionCreate', async (interaction) => {
 
             if (!server) return interaction.editReply(`❌ ポート ${port} の設定が見つかりません。`);
 
-            const chatChannel = client.channels.cache.get(server.channelId) as TextChannel;
-
             try {
-                // --- 1. バックアップ開始の通知 ---
-                // Minecraft 内へ通知
                 sendToConsole(port, "say §e[Backup] World backup starting. Writing will be paused...");
                 
-                // Discord 内へ通知（チャット用チャンネル）
-                if (chatChannel) {
-                    chatChannel.send({
-                        embeds: [{
-                            title: "💾 Backup Status",
-                            description: `🔄 **Port:${port}** のバックアップ処理を開始しました。`,
-                            color: 0xffa500 // オレンジ
-                        }]
-                    }).catch(() => {});
-                }
+                // 4. 管理コマンドの修正
+                broadcastToLinkedChannels(port, {
+                    embeds: [{
+                        title: "💾 Backup Status",
+                        description: `🔄 **Port:${port}** のバックアップ処理を開始しました。`,
+                        color: 0xffa500
+                    }]
+                });
 
-                // データのフラッシュと保持
                 sendToConsole(port, "save hold");
                 await new Promise(resolve => setTimeout(resolve, 5000)); 
 
-                // --- 2. バックアップ実行 ---
                 const result = await runBackup(port, server.cwd);
 
-                // --- 3. バックアップ終了の通知 ---
-                // 書き込み再開命令
                 sendToConsole(port, "save resume");
-
-                // Minecraft 内へ完了通知
                 sendToConsole(port, `say §a[Backup] Backup completed successfully. (Size: ${result.size})`);
 
                 const deltaInfo = result.isFirst ? " (初回)" : ` (前回比: \`${result.delta}\`)`;
                 const successMsg = `✅ **バックアップ完了**\n- ファイル: \`${result.fileName}\`\n- サイズ: \`${result.size}\`${deltaInfo}`;
 
-                // Discord（コマンド実行者への返信）
                 await interaction.editReply(successMsg);
 
-                // Discord（チャット用チャンネルへ完了通知）
-                if (chatChannel) {
-                    chatChannel.send({
-                        embeds: [{
-                            title: "💾 Backup Status",
-                            description: `✅ **Port:${port}** のバックアップが完了しました。\n${successMsg}`,
-                            color: 0x00ff00 // 緑
-                        }]
-                    }).catch(() => {});
-                }
+                // 4. 管理コマンドの修正
+                broadcastToLinkedChannels(port, {
+                    embeds: [{
+                        title: "💾 Backup Status",
+                        description: `✅ **Port:${port}** のバックアップが完了しました。\n${successMsg}`,
+                        color: 0x00ff00
+                    }]
+                });
 
             } catch (err: any) {
-                // エラー発生時の安全装置
                 sendToConsole(port, "save resume"); 
                 sendToConsole(port, "say §c[Backup] バックアップ中にエラーが発生しました。");
                 
@@ -1182,7 +1297,7 @@ client.on('interactionCreate', async (interaction) => {
                     };
                 })
                 .sort((a, b) => b.time.getTime() - a.time.getTime())
-                .slice(0, 10); // 直近10件を表示
+                .slice(0, 10);
 
             if (files.length === 0) return interaction.editReply(`⚠️ バックアップファイルが見つかりません。`);
 
@@ -1202,25 +1317,19 @@ client.on('interactionCreate', async (interaction) => {
         if (subcommand === "restart") {
             if (!activeProcesses[port]) return interaction.reply("サーバーが起動していないため、通常起動します。");
 
-            const server = detectedServers[port];
-            const chatChannel = client.channels.cache.get(server.channelId) as TextChannel;
-
-            // 2. チャットチャンネルへ再起動メッセージを送信
-            if (chatChannel) {
-                chatChannel.send({
-                    embeds: [{
-                        title: "Server Status",
-                        description: `🔄 **Port:${port}** の再起動シーケンスを開始しました。`,
-                        color: 0xffff00 // 黄色
-                    }]
-                }).catch(() => {});
-            }
+            // 4. 管理コマンドの修正
+            broadcastToLinkedChannels(port, {
+                embeds: [{
+                    title: "Server Status",
+                    description: `🔄 **Port:${port}** の再起動シーケンスを開始しました。`,
+                    color: 0xffff00
+                }]
+            });
 
             sendToConsole(port, "say §e[Discord] Restart the server.");
 
             await interaction.reply({ content: `🔄 Port ${port} の再起動を開始しました。`, ephemeral: true });
 
-            // 再起動ロジック：停止を待ってから開始
             activeProcesses[port].once('close', () => {
                 startServer(port);
             });
@@ -1233,14 +1342,12 @@ client.on('interactionCreate', async (interaction) => {
             const server = detectedServers[port];
 
             try {
-                // 1. MongoDB から最新のプレイヤー名リストを取得
                 const record = await PublicStatus.findOne({ port: port });
                 
                 if (!record || record.status === 'offline') {
                     return interaction.editReply(`❌ Port ${port} はオフライン、またはデータがありません。`);
                 }
 
-                // 2. server.properties から最大人数を取得
                 let maxPlayers = "不明";
                 if (server) {
                     const propPath = path.join(server.cwd, "server.properties");
@@ -1251,16 +1358,14 @@ client.on('interactionCreate', async (interaction) => {
                     }
                 }
 
-                // 3. プレイヤー一覧の整形
                 const playerNames = record.playerNames && record.playerNames.length > 0 
                     ? record.playerNames.join("\n") 
                     : "参加中のプレイヤーはいません。";
 
-                // 4. Discord 埋め込みメッセージの送信
                 await interaction.editReply({
                     embeds: [{
                         title: `👥 参加者リスト - Port ${port}`,
-                        color: 0x00FF7F, // 春の緑色
+                        color: 0x00FF7F,
                         fields: [
                             {
                                 name: "📊 接続状況",
@@ -1290,20 +1395,142 @@ client.on('interactionCreate', async (interaction) => {
             return;
         }
     }
+
+    if (group === "mcxb") {
+        await interaction.deferReply();
+
+        if (subcommand === "start") {
+            const res = await startMCXB();
+            await interaction.editReply(res.message);
+        }
+
+        else if (subcommand === "stop") {
+            const res = await stopMCXB();
+            await interaction.editReply(res.message);
+        }
+
+        else if (subcommand === "restart") {
+            await interaction.editReply("🔄 MCXboxBroadcast を再起動しています...");
+            await stopMCXB();
+            
+            setTimeout(async () => {
+                const res = await startMCXB();
+                interaction.followUp(res.message);
+            }, 3000);
+        }
+
+        else if (subcommand === "update") {
+            await interaction.editReply("📦 GitHub から最新リリース情報を取得中...");
+
+            try {
+                const repoOwner = config.mcxn?.repoOwner || "MCXboxBroadcast";
+                const repoName = config.mcxn?.repoName || "Broadcaster";
+                const jarName = config.mcxn?.jarName || "MCXboxBroadcastStandalone.jar";
+                const mcxbCwd = config.mcxn?.cwd || process.cwd();
+
+                if (!fs.existsSync(mcxbCwd)) {
+                    fs.mkdirSync(mcxbCwd, { recursive: true });
+                }
+
+                const apiUrl = `https://api.github.com/repos/${repoOwner}/${repoName}/releases/latest`;
+                
+                const fetchRes = await new Promise<string>((resolve, reject) => {
+                    https.get(apiUrl, { headers: { 'User-Agent': 'Node.js-Bot' } }, (res) => {
+                        if (res.statusCode !== 200) {
+                            return reject(new Error(`API Error: ${res.statusCode} ${res.statusMessage}`));
+                        }
+                        let data = '';
+                        res.on('data', chunk => data += chunk);
+                        res.on('end', () => resolve(data));
+                    }).on('error', reject);
+                });
+
+                const releaseData = JSON.parse(fetchRes);
+                const tagName = releaseData.tag_name;
+
+                const jarAsset = releaseData.assets?.find((asset: any) => 
+                        asset.name.toLowerCase().includes('standalone') && asset.name.endsWith('.jar')
+                    ) || releaseData.assets?.find((asset: any) => asset.name.endsWith('.jar'));
+                if (!jarAsset) {
+                    throw new Error("最新リリースに .jar ファイルが見つかりませんでした。");
+                }
+
+                await interaction.editReply(`📥 最新版 **${tagName}** (${jarAsset.name}) を検出。プロセスの停止と \`${mcxbCwd}\` へのダウンロードを開始します...`);
+
+                await stopMCXB();
+
+                const targetPath = path.join(mcxbCwd, jarName);
+                const backupPath = path.join(mcxbCwd, `${jarName}.bak`);
+
+                if (fs.existsSync(targetPath)) {
+                    fs.copyFileSync(targetPath, backupPath);
+                }
+
+                await downloadLatestRelease(jarAsset.browser_download_url, targetPath);
+
+                await interaction.followUp({
+                    embeds: [{
+                        title: "✅ MCXboxBroadcast アップデート完了",
+                        description: `バージョン **${tagName}** の取得が完了し、指定ディレクトリ (\`${mcxbCwd}\`) に配置しました。\n自動再起動を開始します...`,
+                        color: 0x00ff00,
+                        timestamp: new Date().toISOString()
+                    }]
+                });
+
+                await startMCXB();
+
+            } catch (err: any) {
+                await interaction.followUp(`❌ アップデート失敗:\n\`\`\`\n${err.message}\n\`\`\``);
+            }
+        }
+
+        else if (subcommand === "status") {
+            const isRunning = mcxbProcess !== null && !mcxbProcess.killed;
+            const jarName = config.mcxn?.jarName || "MCXboxBroadcastStandalone.jar";
+            
+            const threadLink = (isRunning && mcxbThreadId) ? `\n└ ログスレッド: <#${mcxbThreadId}>` : "";
+
+            await interaction.editReply({
+                embeds: [{
+                    title: "📡 MCXboxBroadcast 稼働状態",
+                    description: `ステータス: **${isRunning ? "🟢 稼働中" : "🔴 停止中"}**${threadLink}\n実行コマンド: \`java -jar ${jarName}\``,
+                    color: isRunning ? 0x00ff00 : 0xff0000,
+                    timestamp: new Date().toISOString()
+                }]
+            });
+        }
+    }
 });
 
-// --- 以下、APIエンドポイント等は変更なし ---
-
-// 通常のメッセージ転送 (Discord -> Minecraft)
 client.on('messageCreate', (message) => {
     if (message.author.bot) return;
+
     for (const port in detectedServers) {
-        if (detectedServers[port].channelId === message.channel.id) {
+        const channelIds = detectedServers[port].channelIds;
+
+        if (channelIds && channelIds.includes(message.channel.id)) {
+            
             getQueue(port).push({
                 type: "message",
-                author: message.author.displayName,
+                author:  message.author.displayName,
                 content: message.content
             });
+
+            // Discord間のチャットミラーリング転送
+            for (const cid of channelIds) {
+                if (cid !== message.channel.id) {
+                    const otherChannel = client.channels.cache.get(cid) as TextChannel;
+                    if (otherChannel) {
+                        otherChannel.send({
+                            embeds: [{
+                                author: { name: message.author.displayName, icon_url: message.author.displayAvatarURL() },
+                                description: message.content,
+                                color: 0x8a2be2
+                            }]
+                        }).catch(() => {});
+                    }
+                }
+            }
         }
     }
 });
@@ -1322,18 +1549,15 @@ app.post('/:port/eval', (req, res) => {
     res.sendStatus(200);
 });
 
-// --- APIエンドポイント (/:port/list) のデバッグ強化版 ---
 app.post('/:port/list', async (req, res) => {
     const port = req.params.port;
     const { players, names, id } = req.body;
 
     if (players === undefined) return res.sendStatus(400);
 
-    // メモリ上の値は常に更新
     const count = Number(players);
     serverStats[port] = count; 
 
-    // ★ MongoDB の接続状態を確認 (1 = connected)
     if (mongoose.connection.readyState === 1) {
         try {
             const now = new Date();
@@ -1350,11 +1574,9 @@ app.post('/:port/list', async (req, res) => {
                 { upsert: true }
             );
         } catch (err: any) {
-            // DB更新エラーをDiscordログへ（既存のロジック）
             sendErrorToLogChannel(port, err); 
         }
     } else {
-        // 接続が切れている場合は、ログにのみ表示して再接続を促す
         console.log(`⚠️ DB Offline (Port ${port}): 接続待ちのためメモリ更新のみ行いました。readyState: ${mongoose.connection.readyState}`);
     }
 
@@ -1362,69 +1584,45 @@ app.post('/:port/list', async (req, res) => {
     res.sendStatus(200);
 });
 
+// スコアボード一斉送信API
+app.post('/:port/scoreboard', (req, res) => {
+    const port = req.params.port;
+    const { scoreboard_title, content } = req.body;
+    
+    broadcastToLinkedChannels(port, {
+        embeds: [new EmbedBuilder()
+            .setTitle(`📊 ${scoreboard_title}`)
+            .setDescription(content || "データなし")
+            .setColor(0x00ffff)
+            .setTimestamp()
+        ]
+    });
+    res.sendStatus(200);
+});
+
+// メッセージ一斉送信API
 app.post('/:port/send', (req, res) => {
     const port = req.params.port;
     const { author, content } = req.body;
-    const server = detectedServers[port];
-    if (server) {
-        (client.channels.cache.get(server.channelId) as TextChannel).send({
-            embeds: [{ title: author, description: content, color: 0x0000ff }]
-        });
-    }
+    
+    broadcastToLinkedChannels(port, {
+        embeds: [{ title: author, description: content, color: 0x0000ff }]
+    });
     res.sendStatus(200);
 });
 
 app.post('/:port/join', (req, res) => {
-    const port = req.params.port;
-    const { player } = req.body;
-    const server = detectedServers[port];
-    /*
-    if (server) {
-        (client.channels.cache.get(server.channelId) as TextChannel).send({
-            embeds: [{ title: "Join", description: `**${player}** が参加しました。`, color: 0x00ff00 }]
-        });
-    }
-    res.sendStatus(200);*/
+    res.sendStatus(200);
 });
 
 app.post('/:port/leave', (req, res) => {
-    const port = req.params.port;
-    const { player } = req.body;
-    const server = detectedServers[port];
-    /*
-    if (server) {
-        (client.channels.cache.get(server.channelId) as TextChannel).send({
-            embeds: [{ title: "Leave", description: `**${player}** が退出しました。`, color: 0xff0000 }]
-        });
-    }
-    res.sendStatus(200);*/
-});
-
-/*
-app.post('/:port/list', async (req, res) => {
-    const port = req.params.port;
-    const { players, names } = req.body; // ★ names を受け取る
-
-    try {
-        await PublicStatus.findOneAndUpdate(
-            { port: port },
-            {
-                status: 'online',
-                playerCount: Number(players),
-                playerNames: names || [], // ★ 保存
-                lastUpdate: new Date().toLocaleString("ja-JP")
-            },
-            { upsert: true }
-        );
-    } catch (err) { console.error(err); }
     res.sendStatus(200);
-});*/
+});
 
 app.get('/:port/status-of/:targetPort', async (req, res) => {
     const targetPort = req.params.targetPort;
 
     try {
-        // 特定のポートの情報を検索
         const record = await PublicStatus.findOne({ port: targetPort });
 
         if (!record) {
@@ -1451,7 +1649,6 @@ app.get('/:port/user-list/:targetPort', async (req, res) => {
         const record = await PublicStatus.findOne({ port: targetPort });
         if (!record) return res.status(404).json({ error: "No data" });
 
-        // server.properties から最大人数を取得
         let maxPlayers = "不明";
         if (server) {
             const propPath = path.join(server.cwd, "server.properties");
@@ -1470,13 +1667,121 @@ app.get('/:port/user-list/:targetPort', async (req, res) => {
     } catch (err) { res.status(500).send(err); }
 });
 
-// 1分ごとに接続をチェックし、死んでいれば「外科手術」を行う
 setInterval(async () => {
     if (mongoose.connection.readyState === 0) {
         console.warn("⚠️ データベースが切断されています。自動復旧を開始します...");
-        await reconnectDB(); // 強制リセット
+        await reconnectDB();
     }
 }, 60000);
+
+app.get('/logs', (req, res) => {
+    const html = `
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+        <meta charset="UTF-8">
+        <title>Realtime Server Logs</title>
+        <style>
+            body { background: #1e1e1e; color: #cccccc; font-family: Consolas, monospace; margin: 0; padding: 20px; }
+            h2 { color: #4CAF50; margin-top: 0; display: flex; align-items: center; gap: 10px; }
+            select { background: #333; color: #fff; border: 1px solid #555; padding: 5px; margin-bottom: 15px; font-size: 16px; }
+            #terminal { background: #000; padding: 15px; border-radius: 5px; height: 75vh; overflow-y: auto; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); }
+            .log-line { margin-bottom: 4px; word-wrap: break-word; font-size: 14px; line-height: 1.4; border-bottom: 1px solid #222; padding-bottom: 2px; }
+            .source-tag { font-weight: bold; padding: 2px 6px; border-radius: 3px; margin-right: 8px; display: inline-block; min-width: 50px; text-align: center; }
+            .tag-MCXB { background: #d32f2f; color: #fff; }
+            .tag-MCXB_ERR { background: #ff0000; color: #fff; font-weight: 900; border: 1px solid yellow; }
+            .tag-BDS { background: #1976d2; color: #fff; }
+            .time { color: #888; margin-right: 8px; }
+        </style>
+    </head>
+    <body>
+        <h2>📡 Server Control Tower Logs</h2>
+        <select id="filter">
+            <option value="ALL">ALL (すべてのログ)</option>
+            <option value="MCXB">MCXBのみ</option>
+            <option value="BDS">BDS (Minecraft) のみ</option>
+        </select>
+        <div id="terminal"></div>
+
+        <script>
+            const terminal = document.getElementById('terminal');
+            const filter = document.getElementById('filter');
+            
+            const eventSource = new EventSource('/logs/stream');
+
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                const currentFilter = filter.value;
+                
+                const isMCXB = data.source.toString().includes("MCXB");
+                if (currentFilter === 'MCXB' && !isMCXB) return;
+                if (currentFilter === 'BDS' && isMCXB) return;
+
+                let tagClass = isMCXB ? (data.source === "MCXB_ERR" ? "tag-MCXB_ERR" : "tag-MCXB") : "tag-BDS";
+                const timeStr = new Date().toLocaleTimeString();
+                
+                const div = document.createElement('div');
+                div.className = 'log-line';
+                const safeLine = data.line.replace(/[&<>'"]/g, tag => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[tag]));
+                div.innerHTML = \`<span class="time">[\${timeStr}]</span><span class="source-tag \${tagClass}">\${data.source}</span> \${safeLine}\`;
+                
+                terminal.appendChild(div);
+
+                if (terminal.scrollHeight - terminal.scrollTop <= terminal.clientHeight + 50) {
+                    terminal.scrollTop = terminal.scrollHeight;
+                }
+                
+                if (terminal.childElementCount > 2000) {
+                    terminal.removeChild(terminal.firstChild);
+                }
+            };
+        </script>
+    </body>
+    </html>
+    `;
+    res.send(html);
+});
+
+app.get('/logs/stream', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    const listener = (data: { source: string, line: string }) => {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    logEmitter.on('log', listener);
+
+    req.on('close', () => {
+        logEmitter.removeListener('log', listener);
+    });
+});
+
+const logBuffer: { source: string, line: string, timestamp: Date }[] = [];
+
+logEmitter.on('log', (data) => {
+    logBuffer.push({
+        source: data.source,
+        line: data.line,
+        timestamp: new Date()
+    });
+});
+
+setInterval(async () => {
+    if (logBuffer.length === 0) return; 
+    if (mongoose.connection.readyState !== 1) return; 
+
+    const logsToWrite = [...logBuffer];
+    logBuffer.length = 0;
+
+    try {
+        await ServerLog.insertMany(logsToWrite);
+    } catch (err: any) {
+        console.error("❌ DB Log Sync Error:", err.message);
+    }
+}, 5000);
 
 app.listen(9000, () => {
     console.log("Manager API is running on port 9000");

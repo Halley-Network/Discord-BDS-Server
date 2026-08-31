@@ -1,20 +1,41 @@
 {
     "discordToken": "",
-    "guildId": "878955580709031956",
-    "logChannelId": "1469111225370546199",
+    "guildId": "1230522355298730017",
+    "logChannelId": "1543604126108225709",
     "servers": {
-        "19132": { "channelId": "1069189621096910908" },
-        "19133": { "channelId": "1232298489925603328" }
+        "19132": {
+            "channelIds": [
+                "1232313850158649374",
+                "1479176803250868306"
+            ]
+        },
+        "19133": {
+            "channelIds": [
+                "1232313908606275595",
+                "1481689045405929664"
+            ]
+        },
+        "19134": {
+            "channelIds": [
+                "1232313933650464829"
+            ]
+        }
     },
     "commands": {
         "enableNormalCommands": true,
         "opCommands": {
             "enable": true,
-            "roleId": "878969359492599839"
+            "roleId": "1232323384004706314"
         }
     },
     "system": {
         "gitpull_target": ["TransferServers", "Discord-BDS-Client"]
     },
-    "mongoUri": ""
+    "mongoUri": "",
+    "mcxn": {
+        "jarName": "MCXboxBroadcastStandalone.jar",
+        "cwd": "C:\\Users\\YSK\\Desktop\\Apps\\MCXboxBroadcast",
+        "repoOwner": "MCXboxBroadcast",
+        "repoName": "Broadcaster"
+    }
 }
