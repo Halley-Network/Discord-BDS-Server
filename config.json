@@ -2,6 +2,8 @@
     "discordToken": "",
     "guildId": "1230522355298730017",
     "logChannelId": "1543604126108225709",
+    "fallbackLogChannelId": "1544174023804715019",
+    "monitorChannelId": "1544175430284615741",
     "servers": {
         "19132": {
             "channelIds": [

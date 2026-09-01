@@ -358,6 +358,9 @@ async function startMCXB(): Promise<{ success: boolean; message: string }> {
     const logChannelId = config.logChannelId;
     const logChannel = client.channels.cache.get(logChannelId) as TextChannel;
     
+    // ★追加: 予備ルート用のチャンネルを取得 (未設定の場合は logChannel を代用)
+    const fallbackChannel = client.channels.cache.get(config.fallbackLogChannelId || logChannelId) as TextChannel;
+    
     if (!logChannel) {
         return { success: false, message: "❌ ログチャンネルが見つからないため起動を中止しました。" };
     }
@@ -395,13 +398,16 @@ async function startMCXB(): Promise<{ success: boolean; message: string }> {
 
                 try {
                     if (mcxbThreadId) {
-                        const logThread = await client.channels.fetch(mcxbThreadId) as any;
+                        const logThread = client.channels.cache.get(mcxbThreadId) as any;
                         if (logThread) {
-                            await logThread.send(`\`${new Date().toLocaleTimeString()}\` \`\`\`\n${cleanLine}\n\`\`\``);
+                            logThread.send(`\`${new Date().toLocaleTimeString()}\` \`\`\`\n${cleanLine}\n\`\`\``).catch(() => {});
+                        } else {
+                            // ★修正: 専用の予備チャンネルへ送信
+                            if (fallbackChannel) fallbackChannel.send(`[MCXB] ${cleanLine}`).catch(() => {});
                         }
                     }
                 } catch (e) {
-                    logChannel.send(`[MCXB] ${cleanLine}`).catch(() => {});
+                    console.error("MCXB Log Error:", e);
                 }
             }
         });
@@ -412,10 +418,13 @@ async function startMCXB(): Promise<{ success: boolean; message: string }> {
 
             logEmitter.emit('log', { source: "MCXB_ERR", line: line });
 
+            // ★修正: fetch ではなく cache.get を使用
             try {
                 if (mcxbThreadId) {
-                    const logThread = await client.channels.fetch(mcxbThreadId) as any;
-                    if (logThread) await logThread.send(`\`${new Date().toLocaleTimeString()}\` **[ERR]** \`\`\`\n${line}\n\`\`\``);
+                    const logThread = client.channels.cache.get(mcxbThreadId) as any;
+                    if (logThread) {
+                        logThread.send(`\`${new Date().toLocaleTimeString()}\` **[ERR]** \`\`\`\n${line}\n\`\`\``).catch(() => {});
+                    }
                 }
             } catch (e) {}
         });
@@ -747,6 +756,9 @@ async function startServer(port: string) {
     const logChannel = client.channels.cache.get(config.logChannelId) as TextChannel;
     if (!logChannel) return console.error("❌ ログチャンネルが見つかりません。");
 
+    // ★追加: 予備ルート用のチャンネルを取得
+    const fallbackChannel = client.channels.cache.get(config.fallbackLogChannelId || config.logChannelId) as TextChannel;
+
     const now = new Date();
     const startTimeStr = `${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}${now.getDate().toString().padStart(2, '0')}_${now.getHours().toString().padStart(2, '0')}${now.getMinutes().toString().padStart(2, '0')}${now.getSeconds().toString().padStart(2, '0')}`;
     const threadName = `${port}_${startTimeStr}`;
@@ -782,12 +794,15 @@ async function startServer(port: string) {
             logEmitter.emit('log', { source: port, line: cleanLine });
 
             try {
-                const logThread = await client.channels.fetch(activeThreads[port]) as any;
+                const logThread = client.channels.cache.get(activeThreads[port]) as any;
                 if (logThread) {
-                    await logThread.send(`\`${new Date().toLocaleTimeString()}\` \`\`\`\n${cleanLine}\n\`\`\``);
+                    logThread.send(`\`${new Date().toLocaleTimeString()}\` \`\`\`\n${cleanLine}\n\`\`\``).catch(() => {});
+                } else {
+                    // ★修正: 専用の予備チャンネルへ送信
+                    if (fallbackChannel) fallbackChannel.send(`[${port}] ${cleanLine}`).catch(() => {});
                 }
             } catch (e) {
-                logChannel.send(`[${port}] ${cleanLine}`).catch(() => {});
+                console.error(`BDS Log Error [Port ${port}]:`, e);
             }
             
             // 3. 参加・退出ログの修正
@@ -832,7 +847,8 @@ async function startServer(port: string) {
                 color: 0xff0000
             }]
         });
-
+        
+        const thread = client.channels.cache.get(activeThreads[port]) as any;
         if (thread) {
             thread.send(`🛑 サーバーが停止しました。 (Code: ${code})`)
                 .then(() => {
