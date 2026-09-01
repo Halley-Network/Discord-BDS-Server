@@ -35,6 +35,7 @@ const client = new Client({
 
 // 実行中のモニター更新を管理する変数
 let currentMonitorInterval: NodeJS.Timeout | null = null;
+let monitorMessage: any = null;
 
 const app = express();
 app.use(bodyParser.json());
@@ -619,6 +620,39 @@ function generateStatusEmbed() {
     };
 }
 
+// ★追加: 自動モニター機能の関数
+async function startAutoMonitor() {
+    // configに設定がない場合はコマンドチャンネルで代用
+    const channelId = config.monitorChannelId || config.commandChannelId || config.logChannelId;
+    const channel = client.channels.cache.get(channelId) as TextChannel;
+    
+    if (!channel) return console.error("❌ モニター用のチャンネルが見つかりません。");
+
+    try {
+        if (currentMonitorInterval) clearInterval(currentMonitorInterval);
+
+        // 新しいモニターパネルを送信して変数に保存
+        monitorMessage = await channel.send({ embeds: [generateStatusEmbed()] });
+
+        // 10秒ごとにメッセージを編集（更新）
+        currentMonitorInterval = setInterval(async () => {
+            if (monitorMessage) {
+                try {
+                    await monitorMessage.edit({ embeds: [generateStatusEmbed()] });
+                } catch (err) {
+                    // ユーザーが手動でメッセージを削除した場合などはループを止める
+                    clearInterval(currentMonitorInterval!);
+                    currentMonitorInterval = null;
+                    monitorMessage = null;
+                }
+            }
+        }, 10000);
+        console.log("✅ 起動時の自動モニターを開始しました。");
+    } catch (err) {
+        console.error("❌ モニター初期化エラー:", err);
+    }
+}
+
 async function runGitPull(port: string): Promise<string> {
     const server = detectedServers[port];
     if (!server) return `Port ${port}: サーバーが見つかりません。`;
@@ -892,6 +926,9 @@ client.on('ready', async () => {
     checkOrphanedProcesses();
     console.log(`🚀 Manager logged in as ${client.user!.tag}`);
     await client.application!.commands.set([DiscordCommandData], config.guildId);
+
+    // 準備完了後に自動モニターを開始
+    startAutoMonitor();
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -997,24 +1034,32 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (subcommand === "monitor") {
+            await interaction.deferReply();
+
+            // 既存のループと古いメッセージを破棄
             if (currentMonitorInterval) {
                 clearInterval(currentMonitorInterval);
                 currentMonitorInterval = null;
             }
+            if (monitorMessage) {
+                monitorMessage.delete().catch(() => {});
+            }
 
-            await interaction.reply({ 
+            // 新しいチャンネルでパネルを出し直す
+            monitorMessage = await interaction.editReply({ 
                 embeds: [generateStatusEmbed()] 
             });
 
             currentMonitorInterval = setInterval(async () => {
-                try {
-                    await interaction.editReply({ 
-                        embeds: [generateStatusEmbed()] 
-                    });
-                } catch (error) {
-                    if (currentMonitorInterval) {
-                        clearInterval(currentMonitorInterval);
-                        currentMonitorInterval = null;
+                if (monitorMessage) {
+                    try {
+                        await monitorMessage.edit({ embeds: [generateStatusEmbed()] });
+                    } catch (error) {
+                        if (currentMonitorInterval) {
+                            clearInterval(currentMonitorInterval);
+                            currentMonitorInterval = null;
+                            monitorMessage = null;
+                        }
                     }
                 }
             }, 10000);
